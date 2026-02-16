@@ -163,6 +163,63 @@ echo '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}' | \
 6. When creating content, default to `draft` status unless explicitly told to publish
 7. When modifying settings, confirm the change with the user first
 
+## Content Formatting Rules
+
+When creating posts, pages, or product descriptions, follow these rules strictly:
+
+### Use WordPress block markup
+WordPress uses Gutenberg blocks. All content MUST use block comments. Example:
+
+```html
+<!-- wp:paragraph -->
+<p>This is a paragraph of text.</p>
+<!-- /wp:paragraph -->
+
+<!-- wp:heading {"level":2} -->
+<h2 class="wp-block-heading">Section Title</h2>
+<!-- /wp:heading -->
+
+<!-- wp:paragraph -->
+<p>Another paragraph.</p>
+<!-- /wp:paragraph -->
+
+<!-- wp:list -->
+<ul class="wp-block-list">
+<li>Item one</li>
+<li>Item two</li>
+</ul>
+<!-- /wp:list -->
+```
+
+### DO NOT use:
+- Raw HTML without block wrappers (it renders but looks broken in the editor)
+- Markdown (WordPress doesn't render it)
+- Escaped HTML entities like `&lt;p&gt;` — use actual `<p>` tags
+- Inline styles unless specifically asked
+- `<br>` tags between paragraphs — use separate `<!-- wp:paragraph -->` blocks instead
+
+### For WooCommerce product descriptions:
+- Short descriptions: plain HTML is fine (`<p>A great widget.</p>`)
+- Long descriptions: use block markup like posts
+
+### After creating content, ALWAYS verify it:
+```bash
+# Check the post renders correctly
+wp post get <ID> --field=content --path=/var/www/html --allow-root
+```
+
+If the content looks wrong (escaped HTML, missing blocks, garbled text), update it:
+```bash
+cat > /tmp/fixed-content.html <<'CONTENT'
+<!-- wp:paragraph -->
+<p>Corrected content here.</p>
+<!-- /wp:paragraph -->
+CONTENT
+
+wp post update <ID> /tmp/fixed-content.html --path=/var/www/html --allow-root
+rm /tmp/fixed-content.html
+```
+
 ## AI Content Generation
 
 Use the WordPress AI Client SDK for content generation:
@@ -170,4 +227,4 @@ Use the WordPress AI Client SDK for content generation:
 - Create images for posts and products
 - The SDK is provider-agnostic (OpenAI, Anthropic, Google)
 
-When the user asks to "write a post about X" or "generate content for Y", use the AI generation ability first to create the content, then use the create-post ability to publish it.
+When the user asks to "write a post about X" or "generate content for Y", generate the content yourself using your own knowledge, format it with proper WordPress blocks, then create the post. Always verify the result.
