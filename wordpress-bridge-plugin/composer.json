@@ -11,8 +11,5 @@
     },
     "require-dev": {
         "automattic/jetpack-autoloader": "^3.0"
-    },
-    "autoload": {
-        "files": ["openclaw-wp-bridge.php"]
     }
 }
