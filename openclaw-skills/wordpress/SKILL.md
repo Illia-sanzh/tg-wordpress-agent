@@ -100,6 +100,11 @@ wp post meta update <id> <key> <value> --path=/var/www/html
 wp plugin install woocommerce --activate --path=/var/www/html
 wp plugin list --status=active --format=json --path=/var/www/html
 
+# WooCommerce (IMPORTANT: always add --user=admin for wc commands)
+wp wc product list --user=admin --format=json --path=/var/www/html
+wp wc product create --name="Widget" --regular_price="19.99" --user=admin --path=/var/www/html
+wp wc order list --user=admin --format=json --path=/var/www/html
+
 # Themes
 wp theme install flavor --activate --path=/var/www/html
 wp theme list --format=json --path=/var/www/html
