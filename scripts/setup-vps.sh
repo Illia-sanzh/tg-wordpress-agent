@@ -246,7 +246,7 @@ fi
 # Install Composer dependencies in plugin
 if [[ -f "$PLUGIN_DIR/composer.json" ]]; then
     cd "$PLUGIN_DIR"
-    composer install --no-dev 2>/dev/null || warn "Composer install for bridge plugin had issues — dependencies may need manual setup"
+    composer install --no-dev --no-interaction 2>&1 || warn "Composer install for bridge plugin had issues — dependencies may need manual setup"
     cd "${WP_PATH}"
 fi
 
