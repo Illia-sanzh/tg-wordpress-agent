@@ -56,10 +56,43 @@ Always use WP-CLI with the site path:
 wp <command> --path=/var/www/html
 ```
 
+### IMPORTANT: Creating posts with content
+
+**NEVER pass long content directly as a --post_content argument.** Special characters, quotes, and HTML will break the command. Instead, use one of these approaches:
+
+**Approach 1 (preferred): Write content to a temp file, then pipe it**
+```bash
+cat > /tmp/post-content.html <<'CONTENT'
+<p>Your post content goes here.</p>
+<p>It can contain HTML, quotes, and special characters safely.</p>
+CONTENT
+
+wp post create --post_title="My Post" --post_status=draft --path=/var/www/html < /tmp/post-content.html --allow-root
+rm /tmp/post-content.html
+```
+
+**Approach 2: Create post first, then update content separately**
+```bash
+# Create with title only
+POST_ID=$(wp post create --post_title="My Post" --post_status=draft --porcelain --path=/var/www/html --allow-root)
+
+# Write content to file and update
+cat > /tmp/post-content.html <<'CONTENT'
+<p>Your full content here.</p>
+CONTENT
+
+wp post update $POST_ID /tmp/post-content.html --path=/var/www/html --allow-root
+rm /tmp/post-content.html
+```
+
+For short content (a single sentence with no special characters), inline is fine:
+```bash
+wp post create --post_title="Hello" --post_content="Simple text here" --post_status=draft --path=/var/www/html --allow-root
+```
+
 Common patterns:
 ```bash
 # Content
-wp post create --post_title="Hello" --post_content="World" --post_status=publish --path=/var/www/html
 wp post list --post_type=post --format=json --path=/var/www/html
 wp post meta update <id> <key> <value> --path=/var/www/html
 
