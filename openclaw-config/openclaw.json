@@ -1,24 +1,21 @@
 {
-    "agent": {
-        "model": "anthropic/claude-sonnet-4-5-20250929"
+    "agents": {
+        "defaults": {
+            "model": {
+                "primary": "anthropic/claude-sonnet-4-5-20250929"
+            }
+        }
     },
     "gateway": {
         "port": 18789,
-        "bind": "loopback",
-        "auth": {
-            "mode": "password"
-        },
-        "tailscale": {
-            "mode": "off"
-        }
+        "bind": "loopback"
     },
     "channels": {
         "telegram": {
             "enabled": true,
             "botToken": "YOUR_TELEGRAM_BOT_TOKEN_HERE",
             "dmPolicy": "pairing",
-            "allowFrom": ["YOUR_TELEGRAM_USER_ID"],
-            "sendPolicy": "reply"
+            "allowFrom": ["YOUR_TELEGRAM_USER_ID"]
         }
     }
 }
