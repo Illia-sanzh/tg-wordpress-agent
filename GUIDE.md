@@ -113,7 +113,7 @@ Open a terminal and SSH in:
 ssh root@YOUR_VPS_IP
 ```
 
-> **First time connecting?** You'll see a fingerprint warning — type `yes` to continue.  
+> **First time connecting?** You'll see a fingerprint warning — type `yes` to continue.
 
 ### Clone this repository
 
@@ -122,96 +122,48 @@ git clone https://github.com/YOUR_USERNAME/tg-wordpress-agent.git /opt/tg-wordpr
 cd /opt/tg-wordpress-agent
 ```
 
-Now choose the option that matches your situation:
+### Run the installer
 
----
+```bash
+bash /opt/tg-wordpress-agent/scripts/install.sh
+```
 
-### Option A: Fresh server (no WordPress yet)
+The installer will ask you a few questions:
 
-Use this if your VPS is brand new or doesn't have WordPress installed.
+1. **Your domain or IP address** — if you don't have a domain, just use the server's IP
+2. **Telegram bot token** — from Step 1 above
+3. **Your Telegram user ID** — from Step 1 above
+4. **Anthropic API key** — from [console.anthropic.com](https://console.anthropic.com)
+5. **Your email** — for the WordPress admin account and SSL
 
-**Set your details** (replace the placeholder values with your own):
+That's it. The script handles everything automatically:
+
+- **Detects existing WordPress** — if you already have WordPress installed, it skips the web stack and only adds the AI agent
+- **Fresh server?** Installs the full stack: Nginx, PHP, MariaDB, WordPress, SSL, firewall
+- Installs the OpenClaw bridge plugin and AI gateway
+- Creates a systemd service (auto-starts on boot)
+- Handles IP-only setups (no domain needed)
+
+**When it finishes**, it prints your credentials. **Save these somewhere safe.** They're also saved to `/root/setup-credentials.txt` (delete after noting them down).
+
+> **Using Apache instead of Nginx?** No problem. If WordPress is already running, the installer detects it and doesn't touch your web server configuration.
+
+### Advanced: Non-interactive mode
+
+If you prefer to set everything in advance (useful for automation), you can use the lower-level script:
 
 ```bash
 export WP_DOMAIN="your-domain.com"
+export TELEGRAM_BOT_TOKEN="your-token"
+export TELEGRAM_USER_ID="your-id"
+export ANTHROPIC_API_KEY="sk-ant-..."
 export WP_ADMIN_EMAIL="you@email.com"
-export TELEGRAM_BOT_TOKEN="7123456789:AAF1234abcd5678efgh"
-export TELEGRAM_USER_ID="123456789"
-export ANTHROPIC_API_KEY="sk-ant-api03-..."
-```
+# For existing WordPress, also set:
+# export EXISTING_WORDPRESS="true"
+# export WP_PATH="/var/www/html"
 
-**Run the installer:**
-
-```bash
 bash /opt/tg-wordpress-agent/scripts/setup-vps.sh
 ```
-
-The script installs everything automatically:
-- Nginx web server + PHP + MariaDB database
-- WordPress (latest version) with WP-CLI
-- The OpenClaw bridge plugin
-- Node.js + OpenClaw AI gateway
-- SSL certificate (Let's Encrypt)
-- Firewall + fail2ban security
-- Systemd service (auto-starts on boot)
-
-**When it finishes**, it prints your credentials. **Save these somewhere safe:**
-- WordPress admin password
-- WordPress application password (used by the AI agent)
-- Database passwords
-
-They're also saved to `/root/setup-credentials.txt` (delete this file after you've noted them down).
-
----
-
-### Option B: Server with existing WordPress
-
-Use this if WordPress is already running on your server (self-hosted with Nginx or Apache, any version 6.0+).
-
-**Step 1: Set your details**
-
-```bash
-# Your existing domain and WordPress path
-export WP_DOMAIN="your-domain.com"
-export WP_PATH="/var/www/html"                    # ← Change if WP is elsewhere
-export WP_ADMIN_USER="admin"                      # ← Your existing WP admin username
-export WP_ADMIN_EMAIL="you@email.com"
-
-# Telegram + AI
-export TELEGRAM_BOT_TOKEN="7123456789:AAF1234abcd5678efgh"
-export TELEGRAM_USER_ID="123456789"
-export ANTHROPIC_API_KEY="sk-ant-api03-..."
-
-# Tell the script to skip WordPress/Nginx/DB installation
-export EXISTING_WORDPRESS="true"
-```
-
-**Step 2: Run the installer**
-
-```bash
-bash /opt/tg-wordpress-agent/scripts/setup-vps.sh
-```
-
-With `EXISTING_WORDPRESS=true`, the script **skips** the web stack installation and only:
-- Installs WP-CLI (if not already present)
-- Installs the OpenClaw bridge plugin into your existing site
-- Installs Node.js + OpenClaw
-- Creates the systemd service
-- Creates an application password for REST API access
-
-**Step 3: Verify the bridge plugin**
-
-```bash
-wp plugin status openclaw-wp-bridge --path=$WP_PATH --allow-root
-```
-
-You should see `Status: Active`. If not:
-
-```bash
-wp plugin activate openclaw-wp-bridge --path=$WP_PATH --allow-root
-```
-
-> **Using Apache instead of Nginx?** No problem. The bridge plugin and OpenClaw work with any web server. The setup script won't touch your existing Apache configuration.
 
 ---
 
@@ -701,6 +653,72 @@ rkhunter --check --skip-keypress
 
 ---
 
+### Security Hardening (Recommended)
+
+For production use, run the hardening script to apply enterprise-grade security:
+
+```bash
+bash /opt/tg-wordpress-agent/scripts/harden.sh
+```
+
+> If you ran `install.sh`, you were already prompted to do this at the end.
+
+The hardening script sets up:
+
+#### 1. SSH Key-Only Access
+Disables password login. Only SSH keys work. Make sure you have your SSH key set up first:
+```bash
+# From your LOCAL machine (not the server):
+ssh-copy-id root@YOUR_SERVER_IP
+```
+
+#### 2. Tailscale VPN
+Installs [Tailscale](https://tailscale.com) and moves SSH behind it. After setup:
+- SSH is only accessible via your Tailscale network
+- wp-admin is only accessible via Tailscale
+- You connect with `ssh root@YOUR_TAILSCALE_IP` instead of the public IP
+
+#### 3. API Budget Limits (LiteLLM)
+Installs a [LiteLLM](https://docs.litellm.ai/) proxy between OpenClaw and Anthropic:
+- Sets a monthly spending cap (default: $30)
+- All API calls route through the proxy
+- Prevents runaway costs from the AI agent
+
+To change the budget later:
+```bash
+nano /opt/litellm/config.yaml
+# Edit the max_budget value
+systemctl restart litellm
+```
+
+#### 4. Egress Filtering (Squid)
+Installs a Squid proxy that restricts outbound connections to an allowlist:
+- Only allows traffic to: Anthropic API, WordPress.org, npm, Ubuntu repos, Let's Encrypt, Tailscale, GitHub
+- All other outbound connections are blocked
+- The agent cannot reach arbitrary URLs
+
+To add a domain to the allowlist:
+```bash
+nano /etc/squid/allowed-domains.txt
+# Add your domain (one per line, prefix with . for subdomains)
+systemctl restart squid
+```
+
+#### 5. wp-admin Lockdown
+Restricts `/wp-admin` and `/wp-login.php` to the Tailscale network only. Public visitors can see the site, but cannot access the admin panel.
+
+#### After hardening
+
+| What | How |
+|------|-----|
+| SSH to server | `ssh root@TAILSCALE_IP` |
+| WordPress admin | `http://TAILSCALE_IP/wp-admin` |
+| Check LiteLLM | `journalctl -u litellm -f` |
+| Check Squid | `journalctl -u squid -f` or `tail /var/log/squid/access.log` |
+| View budget usage | `curl -H "Authorization: Bearer YOUR_KEY" http://127.0.0.1:4000/budget/info` |
+
+---
+
 ### Adding a Second WordPress Site
 
 You can manage multiple WordPress sites from the same Telegram bot.
@@ -749,20 +767,35 @@ wp plugin activate openclaw-wp-bridge --path=/var/www/site2 --allow-root
 
 ```json
 {
-  "agent": {
-    "model": "anthropic/claude-sonnet-4-5-20250929"
+  "agents": {
+    "defaults": {
+      "model": {
+        "primary": "anthropic/claude-sonnet-4-5-20250929"
+      }
+    }
   },
   "gateway": {
     "port": 18789,
-    "bind": "loopback"
+    "bind": "loopback",
+    "mode": "local"
   },
   "channels": {
     "telegram": {
       "enabled": true,
       "botToken": "YOUR_TOKEN",
       "dmPolicy": "pairing",
-      "allowFrom": ["YOUR_USER_ID"],
-      "sendPolicy": "reply"
+      "allowFrom": ["YOUR_USER_ID"]
+    }
+  },
+  "mcpServers": {
+    "wordpress": {
+      "command": "npx",
+      "args": ["-y", "@automattic/mcp-wordpress-remote@latest"],
+      "env": {
+        "WP_API_URL": "http://YOUR_DOMAIN/wp-json/mcp/mcp-adapter-default-server",
+        "WP_API_USERNAME": "admin",
+        "WP_API_PASSWORD": "YOUR_APP_PASSWORD"
+      }
     }
   }
 }
@@ -770,12 +803,14 @@ wp plugin activate openclaw-wp-bridge --path=/var/www/site2 --allow-root
 
 | Setting | What it does |
 |---------|-------------|
-| `agent.model` | Which AI model to use. `claude-sonnet-4-5-20250929` is a good balance of speed and capability. Use `claude-opus-4-6` for the most capable model. |
+| `agents.defaults.model.primary` | Which AI model to use. `claude-sonnet-4-5-20250929` is a good balance of speed and capability. Use `claude-opus-4-6` for the most capable model. |
 | `gateway.port` | Internal port for OpenClaw. No need to change this. |
 | `gateway.bind` | `"loopback"` means only accessible from the server itself (secure). |
+| `gateway.mode` | `"local"` for self-hosted deployments. |
 | `channels.telegram.botToken` | Your bot token from BotFather. |
 | `channels.telegram.allowFrom` | Array of Telegram user IDs that can use the bot. Add multiple IDs to allow a team. |
 | `channels.telegram.dmPolicy` | `"pairing"` = must approve new users via CLI. `"open"` = anyone in `allowFrom` can use it immediately. |
+| `mcpServers.wordpress` | MCP connection to WordPress. The installer configures this automatically. Uses `@automattic/mcp-wordpress-remote` to connect via HTTP to the MCP Adapter plugin. |
 
 ### Environment variables — `/home/openclaw/.env`
 

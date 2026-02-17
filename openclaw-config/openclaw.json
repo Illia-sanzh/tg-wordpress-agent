@@ -8,7 +8,8 @@
     },
     "gateway": {
         "port": 18789,
-        "bind": "loopback"
+        "bind": "loopback",
+        "mode": "local"
     },
     "channels": {
         "telegram": {
@@ -16,6 +17,17 @@
             "botToken": "YOUR_TELEGRAM_BOT_TOKEN_HERE",
             "dmPolicy": "pairing",
             "allowFrom": ["YOUR_TELEGRAM_USER_ID"]
+        }
+    },
+    "mcpServers": {
+        "wordpress": {
+            "command": "npx",
+            "args": ["-y", "@automattic/mcp-wordpress-remote@latest"],
+            "env": {
+                "WP_API_URL": "http://YOUR_DOMAIN/wp-json/mcp/mcp-adapter-default-server",
+                "WP_API_USERNAME": "YOUR_WP_ADMIN_USER",
+                "WP_API_PASSWORD": "YOUR_WP_APP_PASSWORD"
+            }
         }
     }
 }

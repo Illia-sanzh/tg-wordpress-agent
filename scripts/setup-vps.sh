@@ -43,6 +43,15 @@ TELEGRAM_BOT_TOKEN="${TELEGRAM_BOT_TOKEN:-}"
 TELEGRAM_USER_ID="${TELEGRAM_USER_ID:-}"
 ANTHROPIC_API_KEY="${ANTHROPIC_API_KEY:-}"
 
+# ── Detect IP-only vs domain ──
+IS_IP_ONLY=false
+if [[ "$WP_DOMAIN" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    IS_IP_ONLY=true
+    WP_PROTOCOL="http"
+else
+    WP_PROTOCOL="https"
+fi
+
 # ── Validate required inputs ──
 [[ "$WP_DOMAIN" == "your-domain.com" ]] && err "Set WP_DOMAIN before running this script (export WP_DOMAIN=your-domain.com)"
 [[ -z "$TELEGRAM_BOT_TOKEN" ]] && warn "TELEGRAM_BOT_TOKEN not set — you'll need to add it to the config manually later."
@@ -195,7 +204,7 @@ else
         --allow-root
 
     wp core install \
-        --url="https://${WP_DOMAIN}" \
+        --url="${WP_PROTOCOL}://${WP_DOMAIN}" \
         --title="My AI-Managed Site" \
         --admin_user="${WP_ADMIN_USER}" \
         --admin_password="${WP_ADMIN_PASS}" \
@@ -215,17 +224,69 @@ else
 fi
 
 # ─────────────────────────────────────────────
-# Phase 5: Install OpenClaw WP Bridge Plugin
+# Phase 5: Install Plugins (Bridge + MCP Adapter + Abilities API)
 # ─────────────────────────────────────────────
-log "Phase 5: Installing OpenClaw WP Bridge plugin..."
+log "Phase 5: Installing plugins (bridge + MCP adapter + Abilities API)..."
 
 # Install Composer if not present
 if ! command -v composer &>/dev/null; then
     curl -sS https://getcomposer.org/installer | php -- --install-dir=/usr/local/bin --filename=composer
 fi
 
-# Copy bridge plugin
-PLUGIN_DIR="${WP_PATH}/wp-content/plugins/openclaw-wp-bridge"
+PLUGINS_DIR="${WP_PATH}/wp-content/plugins"
+
+# ── Install Abilities API plugin ──
+ABILITIES_DIR="${PLUGINS_DIR}/abilities-api"
+if [[ ! -d "$ABILITIES_DIR" ]]; then
+    log "Installing Abilities API plugin from GitHub..."
+    ABILITIES_ZIP=$(mktemp /tmp/abilities-api-XXXX.zip)
+    curl -sL "https://github.com/WordPress/abilities-api/releases/latest/download/abilities-api.zip" -o "$ABILITIES_ZIP" 2>/dev/null
+    if [[ -f "$ABILITIES_ZIP" ]] && unzip -t "$ABILITIES_ZIP" > /dev/null 2>&1; then
+        unzip -qo "$ABILITIES_ZIP" -d "${PLUGINS_DIR}/" 2>/dev/null
+    else
+        warn "ZIP download failed, cloning from GitHub..."
+        git clone --depth 1 https://github.com/WordPress/abilities-api.git "$ABILITIES_DIR" 2>/dev/null || warn "Could not install Abilities API plugin."
+    fi
+    rm -f "$ABILITIES_ZIP"
+fi
+
+if [[ -d "$ABILITIES_DIR" ]]; then
+    if [[ -f "$ABILITIES_DIR/composer.json" ]]; then
+        cd "$ABILITIES_DIR"
+        composer install --no-dev --no-interaction 2>&1 | tail -2 || true
+        cd "${WP_PATH}"
+    fi
+    chown -R www-data:www-data "$ABILITIES_DIR"
+    wp plugin activate abilities-api --path="${WP_PATH}" --allow-root 2>/dev/null || warn "Abilities API activation deferred."
+fi
+
+# ── Install MCP Adapter plugin ──
+MCP_DIR="${PLUGINS_DIR}/mcp-adapter"
+if [[ ! -d "$MCP_DIR" ]]; then
+    log "Installing MCP Adapter plugin from GitHub..."
+    MCP_ZIP=$(mktemp /tmp/mcp-adapter-XXXX.zip)
+    curl -sL "https://github.com/WordPress/mcp-adapter/releases/latest/download/mcp-adapter.zip" -o "$MCP_ZIP" 2>/dev/null
+    if [[ -f "$MCP_ZIP" ]] && unzip -t "$MCP_ZIP" > /dev/null 2>&1; then
+        unzip -qo "$MCP_ZIP" -d "${PLUGINS_DIR}/" 2>/dev/null
+    else
+        warn "ZIP download failed, cloning from GitHub..."
+        git clone --depth 1 https://github.com/WordPress/mcp-adapter.git "$MCP_DIR" 2>/dev/null || warn "Could not install MCP Adapter plugin."
+    fi
+    rm -f "$MCP_ZIP"
+fi
+
+if [[ -d "$MCP_DIR" ]]; then
+    if [[ -f "$MCP_DIR/composer.json" ]]; then
+        cd "$MCP_DIR"
+        composer install --no-dev --no-interaction 2>&1 | tail -2 || true
+        cd "${WP_PATH}"
+    fi
+    chown -R www-data:www-data "$MCP_DIR"
+    wp plugin activate mcp-adapter --path="${WP_PATH}" --allow-root 2>/dev/null || warn "MCP Adapter activation deferred."
+fi
+
+# ── Install Bridge Plugin ──
+PLUGIN_DIR="${PLUGINS_DIR}/openclaw-wp-bridge"
 
 # Back up existing plugin if present
 if [[ -d "$PLUGIN_DIR" ]]; then
@@ -252,10 +313,13 @@ fi
 
 chown -R www-data:www-data "$PLUGIN_DIR"
 
-# Activate plugin
+# Activate bridge plugin
 wp plugin activate openclaw-wp-bridge --path="${WP_PATH}" --allow-root 2>/dev/null || warn "Plugin activation deferred — activate manually after dependencies resolve."
 
-log "Bridge plugin installed."
+# Install MCP WordPress remote transport (for OpenClaw HTTP connection)
+npm install -g @automattic/mcp-wordpress-remote@latest 2>/dev/null || warn "MCP WordPress remote package install failed."
+
+log "All plugins installed."
 
 # ─────────────────────────────────────────────
 # Phase 6: Nginx Configuration (fresh install only)
@@ -309,14 +373,9 @@ fi
 # Phase 7: SSL Certificate (fresh install only)
 # ─────────────────────────────────────────────
 
-if [[ "$EXISTING_WORDPRESS" != "true" ]]; then
+if [[ "$EXISTING_WORDPRESS" != "true" && "$IS_IP_ONLY" != "true" ]]; then
     log "Phase 7: Setting up SSL..."
-
-    if [[ "$WP_DOMAIN" != "your-domain.com" ]]; then
-        certbot --nginx -d "$WP_DOMAIN" --non-interactive --agree-tos -m "$WP_ADMIN_EMAIL" || warn "Certbot failed — set up SSL manually."
-    else
-        warn "Skipping SSL — set WP_DOMAIN to your actual domain first."
-    fi
+    certbot --nginx -d "$WP_DOMAIN" --non-interactive --agree-tos -m "$WP_ADMIN_EMAIL" || warn "Certbot failed — set up SSL manually."
 else
     log "Phase 7: Skipping SSL setup (existing WordPress)."
     info "Your existing SSL configuration is untouched."
@@ -338,9 +397,45 @@ OCLAW_HOME="/home/openclaw"
 OCLAW_CONFIG="${OCLAW_HOME}/.openclaw"
 mkdir -p "${OCLAW_CONFIG}/workspace/skills/wordpress"
 
-# Copy configuration files from our repo
+# Write config directly with correct format (don't copy template — inject values)
+cat > "${OCLAW_CONFIG}/openclaw.json" <<OCJSON
+{
+    "agents": {
+        "defaults": {
+            "model": {
+                "primary": "anthropic/claude-sonnet-4-5-20250929"
+            }
+        }
+    },
+    "gateway": {
+        "port": 18789,
+        "bind": "loopback",
+        "mode": "local"
+    },
+    "channels": {
+        "telegram": {
+            "enabled": true,
+            "botToken": "${TELEGRAM_BOT_TOKEN}",
+            "dmPolicy": "pairing",
+            "allowFrom": ["${TELEGRAM_USER_ID}"]
+        }
+    },
+    "mcpServers": {
+        "wordpress": {
+            "command": "npx",
+            "args": ["-y", "@automattic/mcp-wordpress-remote@latest"],
+            "env": {
+                "WP_API_URL": "${WP_PROTOCOL}://${WP_DOMAIN}/wp-json/mcp/mcp-adapter-default-server",
+                "WP_API_USERNAME": "${WP_ADMIN_USER}",
+                "WP_API_PASSWORD": "${WP_APP_PASSWORD}"
+            }
+        }
+    }
+}
+OCJSON
+
+# Copy agent instructions
 if [[ -d /opt/tg-wordpress-agent/openclaw-config ]]; then
-    cp /opt/tg-wordpress-agent/openclaw-config/openclaw.json "${OCLAW_CONFIG}/openclaw.json"
     cp /opt/tg-wordpress-agent/openclaw-config/AGENTS.md "${OCLAW_CONFIG}/workspace/AGENTS.md"
 fi
 
@@ -348,24 +443,25 @@ if [[ -d /opt/tg-wordpress-agent/openclaw-skills/wordpress ]]; then
     cp /opt/tg-wordpress-agent/openclaw-skills/wordpress/SKILL.md "${OCLAW_CONFIG}/workspace/skills/wordpress/SKILL.md"
 fi
 
-# Inject real values into config
-if [[ -n "$TELEGRAM_BOT_TOKEN" ]]; then
-    sed -i "s/YOUR_TELEGRAM_BOT_TOKEN_HERE/${TELEGRAM_BOT_TOKEN}/g" "${OCLAW_CONFIG}/openclaw.json"
-fi
-if [[ -n "$TELEGRAM_USER_ID" ]]; then
-    sed -i "s/YOUR_TELEGRAM_USER_ID/${TELEGRAM_USER_ID}/g" "${OCLAW_CONFIG}/openclaw.json"
-fi
-
 # Set ownership
 chown -R openclaw:openclaw "$OCLAW_HOME"
 
-# Allow openclaw user to run WP-CLI as www-data (idempotent)
-SUDOERS_LINE="openclaw ALL=(www-data) NOPASSWD: /usr/local/bin/wp"
+# Sudoers: allow openclaw to run WP-CLI and file operations as www-data
 SUDOERS_FILE="/etc/sudoers.d/openclaw"
-if [[ ! -f "$SUDOERS_FILE" ]] || ! grep -qF "$SUDOERS_LINE" "$SUDOERS_FILE"; then
-    echo "$SUDOERS_LINE" > "$SUDOERS_FILE"
-    chmod 440 "$SUDOERS_FILE"
-fi
+cat > "$SUDOERS_FILE" <<'SUDOERS'
+# WP-CLI
+openclaw ALL=(www-data) NOPASSWD: /usr/local/bin/wp
+# File operations in WordPress directory
+openclaw ALL=(www-data) NOPASSWD: /usr/bin/mkdir
+openclaw ALL=(www-data) NOPASSWD: /usr/bin/cp
+openclaw ALL=(www-data) NOPASSWD: /usr/bin/mv
+openclaw ALL=(www-data) NOPASSWD: /usr/bin/rm
+openclaw ALL=(www-data) NOPASSWD: /usr/bin/chmod
+openclaw ALL=(www-data) NOPASSWD: /usr/bin/tee
+openclaw ALL=(www-data) NOPASSWD: /usr/bin/touch
+openclaw ALL=(www-data) NOPASSWD: /usr/local/bin/composer
+SUDOERS
+chmod 440 "$SUDOERS_FILE"
 
 log "OpenClaw installed and configured."
 
@@ -382,7 +478,7 @@ ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
 TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
 
 # WordPress REST API credentials
-WP_SITE_URL=https://${WP_DOMAIN}
+WP_SITE_URL=${WP_PROTOCOL}://${WP_DOMAIN}
 WP_APP_USER=${WP_ADMIN_USER}
 WP_APP_PASSWORD=${WP_APP_PASSWORD}
 
@@ -475,7 +571,7 @@ echo ""
 
 if [[ "$EXISTING_WORDPRESS" != "true" ]]; then
     echo "WordPress:"
-    echo "  URL:      https://${WP_DOMAIN}"
+    echo "  URL:      ${WP_PROTOCOL}://${WP_DOMAIN}"
     echo "  Admin:    ${WP_ADMIN_USER}"
     echo "  Password: ${WP_ADMIN_PASS}"
     echo "  DB Pass:  ${WP_DB_PASS}"
@@ -483,7 +579,7 @@ if [[ "$EXISTING_WORDPRESS" != "true" ]]; then
     echo ""
 else
     echo "WordPress (existing site):"
-    echo "  URL:      https://${WP_DOMAIN}"
+    echo "  URL:      ${WP_PROTOCOL}://${WP_DOMAIN}"
     echo "  Path:     ${WP_PATH}"
     echo "  Admin:    ${WP_ADMIN_USER}"
     echo "  App Pass: ${WP_APP_PASSWORD}"
@@ -519,7 +615,7 @@ echo "════════════════════════�
 
 # Save credentials to a file
 cat > /root/setup-credentials.txt <<CREDS
-WordPress URL: https://${WP_DOMAIN}
+WordPress URL: ${WP_PROTOCOL}://${WP_DOMAIN}
 WordPress Path: ${WP_PATH}
 WordPress Admin: ${WP_ADMIN_USER}
 WordPress Password: ${WP_ADMIN_PASS}
