@@ -23,12 +23,86 @@ GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 CYAN='\033[0;36m'
 BOLD='\033[1m'
+DIM='\033[2m'
 NC='\033[0m'
 
-log()  { echo -e "${GREEN}[+]${NC} $1"; }
 warn() { echo -e "${YELLOW}[!]${NC} $1"; }
 err()  { echo -e "${RED}[x]${NC} $1"; exit 1; }
 info() { echo -e "${CYAN}[i]${NC} $1"; }
+
+# ── Progress bar system ──
+TOTAL_STEPS=10
+_BAR_DRAWN=false
+INSTALL_LOG="/tmp/openclaw-install.log"
+: > "$INSTALL_LOG"
+
+# Draw or redraw the 2-line progress display
+# Usage: progress <step> "Action description"
+progress() {
+    local step=$1
+    local action="$2"
+    local bar_width=30
+    local filled=$((step * bar_width / TOTAL_STEPS))
+    local empty=$((bar_width - filled))
+    local pct=$((step * 100 / TOTAL_STEPS))
+
+    # Build bar
+    local bar=""
+    for ((i=0; i<filled; i++)); do bar+="█"; done
+    for ((i=0; i<empty; i++)); do bar+="░"; done
+
+    if [[ "$_BAR_DRAWN" == "true" ]]; then
+        # Move up 2 lines, clear, redraw
+        echo -ne "\033[2A"
+    fi
+
+    echo -e "\033[2K  ${GREEN}[${bar}]${NC} ${BOLD}${step}/${TOTAL_STEPS}${NC} (${pct}%)"
+    echo -e "\033[2K  ${CYAN}${action}${NC}"
+    _BAR_DRAWN=true
+}
+
+# Update just the action text beneath the bar (no stacking)
+action() {
+    if [[ "$_BAR_DRAWN" == "true" ]]; then
+        echo -ne "\033[1A\033[2K  ${CYAN}$1${NC}\n"
+    else
+        echo -e "  ${CYAN}$1${NC}"
+    fi
+}
+
+# Run a command with a spinner on the action line
+# Usage: spin "message" command arg1 arg2 ...
+spin() {
+    local msg="$1"
+    shift
+    action "⠋ ${msg}"
+
+    # Run in background
+    "$@" >> "$INSTALL_LOG" 2>&1 &
+    local pid=$!
+
+    local frames=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
+    local i=0
+    while kill -0 "$pid" 2>/dev/null; do
+        action "${frames[$i]} ${msg}"
+        i=$(( (i+1) % ${#frames[@]} ))
+        sleep 0.15
+    done
+
+    wait "$pid"
+    local rc=$?
+    if [[ $rc -eq 0 ]]; then
+        action "${GREEN}✓${NC} ${msg}"
+    else
+        action "${RED}✗${NC} ${msg}"
+    fi
+    return $rc
+}
+
+# Run a command silently (output to log only)
+quiet() {
+    "$@" >> "$INSTALL_LOG" 2>&1
+}
 
 # ── Check root ──
 [[ $EUID -ne 0 ]] && err "Run this script as root: sudo bash install.sh"
@@ -236,21 +310,25 @@ fi
 echo ""
 echo -e "${BOLD}Starting installation...${NC}"
 echo ""
+echo ""
 
 # ─────────────────────────────────────────────
 # Phase 1: System Packages
 # ─────────────────────────────────────────────
 
-if [[ "$EXISTING_WORDPRESS" == "true" ]]; then
-    log "Phase 1/10: Installing minimal packages..."
-    apt-get update -qq
-    apt-get install -y -qq curl wget unzip git > /dev/null 2>&1
-else
-    log "Phase 1/10: Installing system packages (this may take a few minutes)..."
-    apt-get update -qq && apt-get upgrade -y -qq > /dev/null 2>&1
+export DEBIAN_FRONTEND=noninteractive
 
+progress 1 "Updating package lists..."
+
+if [[ "$EXISTING_WORDPRESS" == "true" ]]; then
+    spin "Updating package lists" apt-get update -qq
+    spin "Installing base tools" apt-get install -y -qq curl wget unzip git
+else
+    spin "Updating package lists" apt-get update -qq
+
+    action "Installing web server & PHP (this is the longest step)..."
     # Try PHP 8.3 first, fall back to 8.2
-    apt-get install -y -qq \
+    spin "Installing Nginx + PHP + MariaDB" apt-get install -y -qq \
         nginx \
         mariadb-server \
         php8.3-fpm php8.3-mysql php8.3-xml php8.3-mbstring php8.3-curl \
@@ -258,9 +336,9 @@ else
         php8.3-soap php8.3-opcache \
         curl wget unzip git \
         certbot python3-certbot-nginx \
-        ufw fail2ban > /dev/null 2>&1 || {
-        warn "PHP 8.3 not available, trying 8.2..."
-        apt-get install -y -qq \
+        ufw fail2ban || {
+        action "PHP 8.3 unavailable, trying 8.2..."
+        spin "Installing Nginx + PHP 8.2 + MariaDB" apt-get install -y -qq \
             nginx \
             mariadb-server \
             php8.2-fpm php8.2-mysql php8.2-xml php8.2-mbstring php8.2-curl \
@@ -268,30 +346,33 @@ else
             php8.2-soap php8.2-opcache \
             curl wget unzip git \
             certbot python3-certbot-nginx \
-            ufw fail2ban > /dev/null 2>&1
+            ufw fail2ban
     }
 
     PHP_VERSION=$(php -r 'echo PHP_MAJOR_VERSION.".".PHP_MINOR_VERSION;')
-    info "PHP version: $PHP_VERSION"
+    action "${GREEN}✓${NC} System packages installed (PHP ${PHP_VERSION})"
 fi
 
 # ─────────────────────────────────────────────
 # Phase 2: Node.js
 # ─────────────────────────────────────────────
 
+progress 2 "Setting up Node.js..."
+
 if command -v node &>/dev/null && [[ "$(node -v | cut -d. -f1 | tr -d v)" -ge 22 ]]; then
-    log "Phase 2/10: Node.js $(node -v) already installed."
+    action "${GREEN}✓${NC} Node.js $(node -v) already installed"
 else
-    log "Phase 2/10: Installing Node.js 22..."
-    curl -fsSL https://deb.nodesource.com/setup_22.x 2>/dev/null | bash - > /dev/null 2>&1
-    apt-get install -y -qq nodejs > /dev/null 2>&1
+    spin "Adding NodeSource repository" bash -c 'curl -fsSL https://deb.nodesource.com/setup_22.x | bash -'
+    spin "Installing Node.js 22" apt-get install -y -qq nodejs
 fi
 
-npm install -g pnpm > /dev/null 2>&1 || true
+spin "Installing pnpm" npm install -g pnpm || true
 
 # ─────────────────────────────────────────────
 # Phase 3: MariaDB (fresh install only)
 # ─────────────────────────────────────────────
+
+progress 3 "Setting up database..."
 
 WP_DB_NAME="wordpress"
 WP_DB_USER="wpuser"
@@ -300,81 +381,80 @@ MYSQL_ROOT_PASS="$(openssl rand -base64 24)"
 WP_ADMIN_PASS="$(openssl rand -base64 16)"
 
 if [[ "$EXISTING_WORDPRESS" != "true" ]]; then
-    log "Phase 3/10: Setting up database..."
+    spin "Starting MariaDB" bash -c 'systemctl start mariadb && systemctl enable mariadb'
 
-    systemctl start mariadb
-    systemctl enable mariadb > /dev/null 2>&1
-
+    action "Creating database and user..."
     mysql -e "ALTER USER 'root'@'localhost' IDENTIFIED BY '${MYSQL_ROOT_PASS}';" 2>/dev/null || true
     mysql -u root -p"${MYSQL_ROOT_PASS}" -e "
         CREATE DATABASE IF NOT EXISTS ${WP_DB_NAME} CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
         CREATE USER IF NOT EXISTS '${WP_DB_USER}'@'localhost' IDENTIFIED BY '${WP_DB_PASS}';
         GRANT ALL PRIVILEGES ON ${WP_DB_NAME}.* TO '${WP_DB_USER}'@'localhost';
         FLUSH PRIVILEGES;
-    "
+    " >> "$INSTALL_LOG" 2>&1
+    action "${GREEN}✓${NC} Database ready"
 else
-    log "Phase 3/10: Skipping database (existing WordPress)."
+    action "Skipped (existing WordPress)"
 fi
 
 # ─────────────────────────────────────────────
 # Phase 4: WordPress
 # ─────────────────────────────────────────────
 
+progress 4 "Installing WordPress..."
+
 # Always ensure WP-CLI is installed
 if ! command -v wp &>/dev/null; then
-    log "Phase 4/10: Installing WP-CLI..."
-    curl -sO https://raw.githubusercontent.com/wp-cli/builds/gh-pages/phar/wp-cli.phar
-    chmod +x wp-cli.phar
-    mv wp-cli.phar /usr/local/bin/wp
+    spin "Downloading WP-CLI" bash -c 'curl -sO https://raw.githubusercontent.com/wp-cli/builds/gh-pages/phar/wp-cli.phar && chmod +x wp-cli.phar && mv wp-cli.phar /usr/local/bin/wp'
 else
-    log "Phase 4/10: WP-CLI already installed."
+    action "${GREEN}✓${NC} WP-CLI already installed"
 fi
 
 WP_APP_PASSWORD=""
 
 if [[ "$EXISTING_WORDPRESS" == "true" ]]; then
-    # Existing WordPress — just create app password
+    action "Creating application password..."
     WP_APP_PASSWORD=$(wp user application-password create "${WP_ADMIN_USER}" "openclaw-bridge" --porcelain --path="${WP_PATH}" --allow-root 2>/dev/null) || {
         warn "Could not create app password — may already exist."
         WP_APP_PASSWORD="MANUAL_SETUP_NEEDED"
     }
+    action "${GREEN}✓${NC} WordPress configured"
 else
-    log "Phase 4/10: Installing WordPress..."
     mkdir -p "${WP_PATH}"
     cd "${WP_PATH}"
 
-    wp core download --allow-root 2>/dev/null
-    wp config create \
+    spin "Downloading WordPress core" wp core download --allow-root
+    spin "Configuring wp-config.php" wp config create \
         --dbname="${WP_DB_NAME}" \
         --dbuser="${WP_DB_USER}" \
         --dbpass="${WP_DB_PASS}" \
         --dbhost="localhost" \
-        --allow-root 2>/dev/null
+        --allow-root
 
-    # Use http:// for IP-only setups, https:// for domains
-    wp core install \
+    spin "Running WordPress installer" wp core install \
         --url="${WP_PROTOCOL}://${WP_DOMAIN}" \
         --title="My AI-Managed Site" \
         --admin_user="${WP_ADMIN_USER}" \
         --admin_password="${WP_ADMIN_PASS}" \
         --admin_email="${WP_ADMIN_EMAIL}" \
-        --allow-root 2>/dev/null
+        --allow-root
 
+    action "Setting file permissions..."
     chown -R www-data:www-data "${WP_PATH}"
     find "${WP_PATH}" -type d -exec chmod 755 {} \;
     find "${WP_PATH}" -type f -exec chmod 644 {} \;
 
     WP_APP_PASSWORD=$(wp user application-password create "${WP_ADMIN_USER}" "openclaw-bridge" --porcelain --allow-root 2>/dev/null)
+    action "${GREEN}✓${NC} WordPress installed"
 fi
 
 # ─────────────────────────────────────────────
 # Phase 5: Bridge Plugin + MCP Adapter
 # ─────────────────────────────────────────────
-log "Phase 5/10: Installing plugins (bridge + MCP adapter + Abilities API)..."
+progress 5 "Installing WordPress plugins..."
 
 # Install Composer if not present
 if ! command -v composer &>/dev/null; then
-    curl -sS https://getcomposer.org/installer | php -- --install-dir=/usr/local/bin --filename=composer > /dev/null 2>&1
+    spin "Installing Composer" bash -c 'curl -sS https://getcomposer.org/installer | php -- --install-dir=/usr/local/bin --filename=composer'
 fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -384,64 +464,60 @@ PLUGINS_DIR="${WP_PATH}/wp-content/plugins"
 # ── Install Abilities API plugin ──
 ABILITIES_DIR="${PLUGINS_DIR}/abilities-api"
 if [[ ! -d "$ABILITIES_DIR" ]]; then
-    info "Installing Abilities API plugin from GitHub..."
-    ABILITIES_ZIP=$(mktemp /tmp/abilities-api-XXXX.zip)
-    curl -sL "https://github.com/WordPress/abilities-api/releases/latest/download/abilities-api.zip" -o "$ABILITIES_ZIP" 2>/dev/null
-    if [[ -f "$ABILITIES_ZIP" ]] && unzip -t "$ABILITIES_ZIP" > /dev/null 2>&1; then
-        unzip -qo "$ABILITIES_ZIP" -d "${PLUGINS_DIR}/" 2>/dev/null
-    else
-        # Fallback: clone from GitHub
-        warn "ZIP download failed, cloning from GitHub..."
-        git clone --depth 1 https://github.com/WordPress/abilities-api.git "$ABILITIES_DIR" 2>/dev/null || warn "Could not install Abilities API plugin."
-    fi
-    rm -f "$ABILITIES_ZIP"
+    spin "Downloading Abilities API plugin" bash -c "
+        ABILITIES_ZIP=\$(mktemp /tmp/abilities-api-XXXX.zip)
+        curl -sL 'https://github.com/WordPress/abilities-api/releases/latest/download/abilities-api.zip' -o \"\$ABILITIES_ZIP\" 2>/dev/null
+        if [[ -f \"\$ABILITIES_ZIP\" ]] && unzip -t \"\$ABILITIES_ZIP\" > /dev/null 2>&1; then
+            unzip -qo \"\$ABILITIES_ZIP\" -d '${PLUGINS_DIR}/' 2>/dev/null
+        else
+            git clone --depth 1 https://github.com/WordPress/abilities-api.git '${ABILITIES_DIR}' 2>/dev/null
+        fi
+        rm -f \"\$ABILITIES_ZIP\"
+    "
 else
-    info "Abilities API plugin already installed."
+    action "${GREEN}✓${NC} Abilities API already installed"
 fi
 
 if [[ -d "$ABILITIES_DIR" ]]; then
-    # Install Composer dependencies if present
     if [[ -f "$ABILITIES_DIR/composer.json" ]]; then
         cd "$ABILITIES_DIR"
-        composer install --no-dev --no-interaction 2>&1 | tail -2 || true
+        quiet composer install --no-dev --no-interaction || true
         cd /tmp
     fi
     chown -R www-data:www-data "$ABILITIES_DIR"
-    wp plugin activate abilities-api --path="${WP_PATH}" --allow-root 2>/dev/null || warn "Abilities API activation deferred."
+    quiet wp plugin activate abilities-api --path="${WP_PATH}" --allow-root || true
 fi
 
 # ── Install MCP Adapter plugin ──
 MCP_DIR="${PLUGINS_DIR}/mcp-adapter"
 if [[ ! -d "$MCP_DIR" ]]; then
-    info "Installing MCP Adapter plugin from GitHub..."
-    MCP_ZIP=$(mktemp /tmp/mcp-adapter-XXXX.zip)
-    curl -sL "https://github.com/WordPress/mcp-adapter/releases/latest/download/mcp-adapter.zip" -o "$MCP_ZIP" 2>/dev/null
-    if [[ -f "$MCP_ZIP" ]] && unzip -t "$MCP_ZIP" > /dev/null 2>&1; then
-        unzip -qo "$MCP_ZIP" -d "${PLUGINS_DIR}/" 2>/dev/null
-    else
-        # Fallback: clone from GitHub
-        warn "ZIP download failed, cloning from GitHub..."
-        git clone --depth 1 https://github.com/WordPress/mcp-adapter.git "$MCP_DIR" 2>/dev/null || warn "Could not install MCP Adapter plugin."
-    fi
-    rm -f "$MCP_ZIP"
+    spin "Downloading MCP Adapter plugin" bash -c "
+        MCP_ZIP=\$(mktemp /tmp/mcp-adapter-XXXX.zip)
+        curl -sL 'https://github.com/WordPress/mcp-adapter/releases/latest/download/mcp-adapter.zip' -o \"\$MCP_ZIP\" 2>/dev/null
+        if [[ -f \"\$MCP_ZIP\" ]] && unzip -t \"\$MCP_ZIP\" > /dev/null 2>&1; then
+            unzip -qo \"\$MCP_ZIP\" -d '${PLUGINS_DIR}/' 2>/dev/null
+        else
+            git clone --depth 1 https://github.com/WordPress/mcp-adapter.git '${MCP_DIR}' 2>/dev/null
+        fi
+        rm -f \"\$MCP_ZIP\"
+    "
 else
-    info "MCP Adapter plugin already installed."
+    action "${GREEN}✓${NC} MCP Adapter already installed"
 fi
 
 if [[ -d "$MCP_DIR" ]]; then
     if [[ -f "$MCP_DIR/composer.json" ]]; then
         cd "$MCP_DIR"
-        composer install --no-dev --no-interaction 2>&1 | tail -2 || true
+        quiet composer install --no-dev --no-interaction || true
         cd /tmp
     fi
     chown -R www-data:www-data "$MCP_DIR"
-    wp plugin activate mcp-adapter --path="${WP_PATH}" --allow-root 2>/dev/null || warn "MCP Adapter activation deferred."
+    quiet wp plugin activate mcp-adapter --path="${WP_PATH}" --allow-root || true
 fi
 
 # ── Install Bridge Plugin ──
 PLUGIN_DIR="${PLUGINS_DIR}/openclaw-wp-bridge"
 
-# Back up existing plugin if present
 if [[ -d "$PLUGIN_DIR" ]]; then
     rm -rf "${PLUGIN_DIR}.bak"
     mv "$PLUGIN_DIR" "${PLUGIN_DIR}.bak"
@@ -457,27 +533,25 @@ else
     warn "Bridge plugin source not found — clone the repo first."
 fi
 
-# Install Composer dependencies
 if [[ -f "$PLUGIN_DIR/composer.json" ]]; then
     cd "$PLUGIN_DIR"
-    composer install --no-dev --no-interaction 2>&1 | tail -3 || warn "Composer had issues."
+    spin "Installing bridge plugin dependencies" composer install --no-dev --no-interaction || warn "Composer had issues."
     cd /tmp
 fi
 
 chown -R www-data:www-data "$PLUGIN_DIR"
+quiet wp plugin activate openclaw-wp-bridge --path="${WP_PATH}" --allow-root || true
 
-# Activate bridge plugin
-wp plugin activate openclaw-wp-bridge --path="${WP_PATH}" --allow-root 2>/dev/null || warn "Plugin activation deferred."
-
-# Install the MCP WordPress remote transport (for OpenClaw HTTP connection)
-npm install -g @automattic/mcp-wordpress-remote@latest > /dev/null 2>&1 || warn "MCP WordPress remote package install failed."
+spin "Installing MCP WordPress transport" npm install -g @automattic/mcp-wordpress-remote@latest || warn "MCP transport install failed."
+action "${GREEN}✓${NC} All plugins installed"
 
 # ─────────────────────────────────────────────
 # Phase 6: Nginx (fresh install only)
 # ─────────────────────────────────────────────
 
+progress 6 "Configuring web server..."
+
 if [[ "$EXISTING_WORDPRESS" != "true" ]]; then
-    log "Phase 6/10: Configuring web server..."
 
     PHP_VERSION=$(php -r 'echo PHP_MAJOR_VERSION.".".PHP_MINOR_VERSION;')
 
@@ -513,33 +587,37 @@ NGINX
     ln -sf /etc/nginx/sites-available/wordpress /etc/nginx/sites-enabled/
     rm -f /etc/nginx/sites-enabled/default
     nginx -t > /dev/null 2>&1 && systemctl restart nginx
+    action "${GREEN}✓${NC} Nginx configured"
 else
-    log "Phase 6/10: Skipping web server (existing WordPress)."
+    action "Skipped (existing WordPress)"
 fi
 
 # ─────────────────────────────────────────────
 # Phase 7: SSL (domain only, not IP)
 # ─────────────────────────────────────────────
 
+progress 7 "Setting up SSL..."
+
 if [[ "$EXISTING_WORDPRESS" != "true" && "$IS_IP_ONLY" == "false" ]]; then
-    log "Phase 7/10: Setting up SSL certificate..."
-    certbot --nginx -d "$WP_DOMAIN" --non-interactive --agree-tos -m "$WP_ADMIN_EMAIL" 2>/dev/null || warn "SSL setup failed — you can set it up later with: certbot --nginx -d $WP_DOMAIN"
+    spin "Obtaining SSL certificate" certbot --nginx -d "$WP_DOMAIN" --non-interactive --agree-tos -m "$WP_ADMIN_EMAIL" || warn "SSL setup failed — run later: certbot --nginx -d $WP_DOMAIN"
+elif [[ "$IS_IP_ONLY" == "true" ]]; then
+    action "Skipped (IP address — no SSL needed)"
 else
-    log "Phase 7/10: Skipping SSL $(if [[ "$IS_IP_ONLY" == "true" ]]; then echo '(IP address — no SSL needed)'; else echo '(existing WordPress)'; fi)."
+    action "Skipped (existing WordPress)"
 fi
 
 # ─────────────────────────────────────────────
 # Phase 8: OpenClaw
 # ─────────────────────────────────────────────
-log "Phase 8/10: Installing OpenClaw AI gateway..."
+progress 8 "Installing OpenClaw AI gateway..."
 
 # Create system user
 useradd -r -m -s /bin/bash openclaw 2>/dev/null || true
 
 # Install OpenClaw
-npm install -g openclaw@latest > /dev/null 2>&1
+spin "Installing OpenClaw via npm" npm install -g openclaw@latest
 
-# Set up config
+action "Writing configuration..."
 OCLAW_HOME="/home/openclaw"
 OCLAW_CONFIG="${OCLAW_HOME}/.openclaw"
 mkdir -p "${OCLAW_CONFIG}/workspace/skills/wordpress"
@@ -612,11 +690,12 @@ openclaw ALL=(www-data) NOPASSWD: /usr/bin/touch
 openclaw ALL=(www-data) NOPASSWD: /usr/local/bin/composer
 SUDOERS
 chmod 440 "$SUDOERS_FILE"
+action "${GREEN}✓${NC} OpenClaw configured"
 
 # ─────────────────────────────────────────────
 # Phase 9: Environment & Service
 # ─────────────────────────────────────────────
-log "Phase 9/10: Configuring environment..."
+progress 9 "Starting OpenClaw service..."
 
 cat > /home/openclaw/.env <<ENV
 ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
@@ -657,30 +736,38 @@ StandardError=journal
 WantedBy=multi-user.target
 SERVICE
 
-systemctl daemon-reload
-systemctl enable openclaw > /dev/null 2>&1
-systemctl start openclaw
+action "Enabling systemd service..."
+quiet systemctl daemon-reload
+quiet systemctl enable openclaw
+systemctl start openclaw >> "$INSTALL_LOG" 2>&1
+action "${GREEN}✓${NC} OpenClaw service started"
 
 # ─────────────────────────────────────────────
 # Phase 10: Firewall (fresh install only)
 # ─────────────────────────────────────────────
 
+progress 10 "Configuring firewall..."
+
 if [[ "$EXISTING_WORDPRESS" != "true" ]]; then
-    log "Phase 10/10: Configuring firewall..."
-    ufw default deny incoming > /dev/null 2>&1
-    ufw default allow outgoing > /dev/null 2>&1
-    ufw allow ssh > /dev/null 2>&1
-    ufw allow 'Nginx Full' > /dev/null 2>&1
-    ufw --force enable > /dev/null 2>&1
-    systemctl enable fail2ban > /dev/null 2>&1
-    systemctl start fail2ban > /dev/null 2>&1
+    quiet ufw default deny incoming
+    quiet ufw default allow outgoing
+    quiet ufw allow ssh
+    quiet ufw allow 'Nginx Full'
+    quiet ufw --force enable
+    quiet systemctl enable fail2ban
+    quiet systemctl start fail2ban
+    action "${GREEN}✓${NC} Firewall configured"
 else
-    log "Phase 10/10: Skipping firewall (existing WordPress)."
+    action "Skipped (existing WordPress)"
 fi
 
 # ─────────────────────────────────────────────
 # Done — Print Summary
 # ─────────────────────────────────────────────
+
+# Clear progress bar and show completion
+echo ""
+echo ""
 
 # Wait a moment for OpenClaw to start
 sleep 3
