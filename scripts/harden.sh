@@ -219,10 +219,13 @@ sed -i 's/^#*UsePAM.*/UsePAM no/' /etc/ssh/sshd_config
 sed -i 's/^#*PermitRootLogin.*/PermitRootLogin prohibit-password/' /etc/ssh/sshd_config
 
 # Restart SSH (service name varies: "ssh" on Ubuntu 24.04+, "sshd" on older)
-if systemctl list-units --type=service --all | grep -q 'sshd.service'; then
+# Use systemctl cat to check if the service unit actually exists
+if systemctl cat ssh.service > /dev/null 2>&1; then
+    spin "Restarting SSH daemon" systemctl restart ssh
+elif systemctl cat sshd.service > /dev/null 2>&1; then
     spin "Restarting SSH daemon" systemctl restart sshd
 else
-    spin "Restarting SSH daemon" systemctl restart ssh
+    warn "Could not detect SSH service name — restart SSH manually"
 fi
 
 action "${GREEN}✓${NC} SSH hardened — key-only access enabled"
