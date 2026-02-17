@@ -125,8 +125,12 @@ sed -i 's/^#*UsePAM.*/UsePAM no/' /etc/ssh/sshd_config
 # Disable root login with password (key still works)
 sed -i 's/^#*PermitRootLogin.*/PermitRootLogin prohibit-password/' /etc/ssh/sshd_config
 
-# Restart SSH
-systemctl restart sshd
+# Restart SSH (service name varies: "ssh" on Ubuntu 24.04+, "sshd" on older)
+if systemctl list-units --type=service --all | grep -q 'sshd.service'; then
+    systemctl restart sshd
+else
+    systemctl restart ssh
+fi
 
 info "Password SSH disabled. Key-only access enabled."
 
