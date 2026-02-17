@@ -521,7 +521,10 @@ OCLAW_HOME="/home/openclaw"
 OCLAW_CONFIG="${OCLAW_HOME}/.openclaw"
 mkdir -p "${OCLAW_CONFIG}/workspace/skills/wordpress"
 
-# Write config directly with correct format (don't copy template — inject values)
+# Generate a gateway auth token
+GATEWAY_TOKEN="oc-$(openssl rand -hex 24)"
+
+# Write config with correct OpenClaw format
 cat > "${OCLAW_CONFIG}/openclaw.json" <<OCJSON
 {
     "agents": {
@@ -534,29 +537,34 @@ cat > "${OCLAW_CONFIG}/openclaw.json" <<OCJSON
     "gateway": {
         "port": 18789,
         "bind": "loopback",
-        "mode": "local"
+        "mode": "local",
+        "auth": {
+            "mode": "token",
+            "token": "${GATEWAY_TOKEN}"
+        }
     },
     "channels": {
         "telegram": {
             "enabled": true,
             "botToken": "${TELEGRAM_BOT_TOKEN}",
-            "dmPolicy": "pairing",
+            "dmPolicy": "allowlist",
             "allowFrom": ["${TELEGRAM_USER_ID}"]
         }
     },
-    "mcpServers": {
-        "wordpress": {
-            "command": "npx",
-            "args": ["-y", "@automattic/mcp-wordpress-remote@latest"],
-            "env": {
-                "WP_API_URL": "${WP_PROTOCOL}://${WP_DOMAIN}/wp-json/mcp/mcp-adapter-default-server",
-                "WP_API_USERNAME": "${WP_ADMIN_USER}",
-                "WP_API_PASSWORD": "${WP_APP_PASSWORD}"
-            }
+    "tools": {
+        "elevated": {
+            "enabled": true
         }
+    },
+    "env": {
+        "WP_PATH": "${WP_PATH}",
+        "WP_SITE_URL": "${WP_PROTOCOL}://${WP_DOMAIN}",
+        "WP_APP_USER": "${WP_ADMIN_USER}",
+        "WP_APP_PASSWORD": "${WP_APP_PASSWORD}"
     }
 }
 OCJSON
+chmod 600 "${OCLAW_CONFIG}/openclaw.json"
 
 # Copy agent instructions
 if [[ -d /opt/tg-wordpress-agent/openclaw-config ]]; then

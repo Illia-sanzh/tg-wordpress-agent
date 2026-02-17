@@ -16,18 +16,112 @@
 # ─────────────────────────────────────────────────────────────
 set -euo pipefail
 
+# ── Colors ──
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 CYAN='\033[0;36m'
 BOLD='\033[1m'
+DIM='\033[2m'
 NC='\033[0m'
 
-log()  { echo -e "${GREEN}[+]${NC} $1"; }
 warn() { echo -e "${YELLOW}[!]${NC} $1"; }
 err()  { echo -e "${RED}[x]${NC} $1"; exit 1; }
 info() { echo -e "${CYAN}[i]${NC} $1"; }
 
+# ── Progress bar system ──
+TOTAL_STEPS=6
+_BAR_DRAWN=false
+HARDEN_LOG="/tmp/openclaw-harden.log"
+: > "$HARDEN_LOG"
+
+# ── Crash handler — show last log lines on failure ──
+on_error() {
+    local exit_code=$?
+    echo ""
+    echo ""
+    echo -e "${RED}${BOLD}  Hardening failed (exit code ${exit_code})${NC}"
+    echo ""
+    if [[ -s "$HARDEN_LOG" ]]; then
+        echo -e "${YELLOW}  Last 25 lines of ${HARDEN_LOG}:${NC}"
+        echo -e "${DIM}"
+        tail -25 "$HARDEN_LOG" 2>/dev/null | sed 's/^/    /'
+        echo -e "${NC}"
+    fi
+    echo -e "  Full log: ${CYAN}cat ${HARDEN_LOG}${NC}"
+    echo ""
+}
+trap on_error ERR
+
+# Draw or redraw the 2-line progress display
+progress() {
+    local step=$1
+    local action="$2"
+    local bar_width=30
+    local filled=$((step * bar_width / TOTAL_STEPS))
+    local empty=$((bar_width - filled))
+    local pct=$((step * 100 / TOTAL_STEPS))
+
+    local bar=""
+    for ((i=0; i<filled; i++)); do bar+="█"; done
+    for ((i=0; i<empty; i++)); do bar+="░"; done
+
+    if [[ "$_BAR_DRAWN" == "true" ]]; then
+        echo -ne "\033[2A"
+    fi
+
+    echo -e "\033[2K  ${GREEN}[${bar}]${NC} ${BOLD}${step}/${TOTAL_STEPS}${NC} (${pct}%)"
+    echo -e "\033[2K  ${CYAN}${action}${NC}"
+    _BAR_DRAWN=true
+}
+
+# Update just the action text beneath the bar
+action() {
+    if [[ "$_BAR_DRAWN" == "true" ]]; then
+        echo -ne "\033[1A\033[2K  ${CYAN}$1${NC}\n"
+    else
+        echo -e "  ${CYAN}$1${NC}"
+    fi
+}
+
+# Run a command with a spinner on the action line
+spin() {
+    local msg="$1"
+    shift
+    action "⠋ ${msg}"
+
+    ( set +e; "$@" >> "$HARDEN_LOG" 2>&1 ) &
+    local pid=$!
+
+    local frames=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
+    local i=0
+    while kill -0 "$pid" 2>/dev/null; do
+        action "${frames[$i]} ${msg}"
+        i=$(( (i+1) % ${#frames[@]} ))
+        sleep 0.15
+    done
+
+    set +e
+    wait "$pid"
+    local rc=$?
+    set -e
+
+    if [[ $rc -eq 0 ]]; then
+        action "${GREEN}✓${NC} ${msg}"
+    else
+        action "${RED}✗${NC} ${msg} — check ${HARDEN_LOG}"
+        echo "" >> "$HARDEN_LOG"
+        echo "=== FAILED: ${msg} (exit code ${rc}) ===" >> "$HARDEN_LOG"
+    fi
+    return $rc
+}
+
+# Run a command silently (output to log only)
+quiet() {
+    "$@" >> "$HARDEN_LOG" 2>&1
+}
+
+# ── Check root ──
 [[ $EUID -ne 0 ]] && err "Run as root: sudo bash harden.sh"
 
 # ── Load existing config ──
@@ -35,14 +129,13 @@ OCLAW_HOME="/home/openclaw"
 OCLAW_CONFIG="${OCLAW_HOME}/.openclaw"
 WP_PATH="/var/www/html"
 
-# Try to read WP_PATH from .env
 if [[ -f "${OCLAW_HOME}/.env" ]]; then
     WP_PATH=$(grep '^WP_PATH=' "${OCLAW_HOME}/.env" 2>/dev/null | cut -d= -f2 || echo "/var/www/html")
 fi
 
 # ── Configuration ──
 LITELLM_PORT=4000
-LITELLM_BUDGET="${LITELLM_MONTHLY_BUDGET:-30}"  # Default $30/month
+LITELLM_BUDGET="${LITELLM_MONTHLY_BUDGET:-30}"
 SQUID_PORT=3128
 
 clear 2>/dev/null || true
@@ -92,13 +185,14 @@ read -r BUDGET_INPUT
 LITELLM_BUDGET="${BUDGET_INPUT:-$LITELLM_BUDGET}"
 echo ""
 
-# ── Ask for Anthropic key (needed for LiteLLM) ──
+# ── Read Anthropic key from .env (only needed if LiteLLM not already installed) ──
 ANTHROPIC_API_KEY=""
 if [[ -f "${OCLAW_HOME}/.env" ]]; then
     ANTHROPIC_API_KEY=$(grep '^ANTHROPIC_API_KEY=' "${OCLAW_HOME}/.env" 2>/dev/null | cut -d= -f2 || echo "")
 fi
 
-if [[ -z "$ANTHROPIC_API_KEY" ]]; then
+# If LiteLLM is not yet installed and we don't have a key, ask for one
+if ! systemctl is-active litellm > /dev/null 2>&1 && [[ -z "$ANTHROPIC_API_KEY" || "$ANTHROPIC_API_KEY" == sk-litellm-* ]]; then
     echo -ne "${CYAN}  Anthropic API key (for LiteLLM proxy)${NC}: "
     read -rs ANTHROPIC_API_KEY
     echo ""
@@ -107,110 +201,117 @@ fi
 echo ""
 echo -e "${BOLD}  Starting hardening...${NC}"
 echo ""
+echo ""
 
 # ═════════════════════════════════════════════
 # Step 1: SSH Hardening
 # ═════════════════════════════════════════════
-log "Step 1/5: Hardening SSH..."
+progress 1 "Hardening SSH..."
 
 # Backup sshd_config
 cp /etc/ssh/sshd_config /etc/ssh/sshd_config.bak.$(date +%Y%m%d%H%M%S) 2>/dev/null || true
 
-# Disable password authentication
+action "Disabling password authentication..."
 sed -i 's/^#*PasswordAuthentication.*/PasswordAuthentication no/' /etc/ssh/sshd_config
 sed -i 's/^#*ChallengeResponseAuthentication.*/ChallengeResponseAuthentication no/' /etc/ssh/sshd_config
 sed -i 's/^#*KbdInteractiveAuthentication.*/KbdInteractiveAuthentication no/' /etc/ssh/sshd_config
 sed -i 's/^#*UsePAM.*/UsePAM no/' /etc/ssh/sshd_config
-
-# Disable root login with password (key still works)
 sed -i 's/^#*PermitRootLogin.*/PermitRootLogin prohibit-password/' /etc/ssh/sshd_config
 
 # Restart SSH (service name varies: "ssh" on Ubuntu 24.04+, "sshd" on older)
 if systemctl list-units --type=service --all | grep -q 'sshd.service'; then
-    systemctl restart sshd
+    spin "Restarting SSH daemon" systemctl restart sshd
 else
-    systemctl restart ssh
+    spin "Restarting SSH daemon" systemctl restart ssh
 fi
 
-info "Password SSH disabled. Key-only access enabled."
+action "${GREEN}✓${NC} SSH hardened — key-only access enabled"
 
 # ═════════════════════════════════════════════
 # Step 2: Tailscale VPN
 # ═════════════════════════════════════════════
-log "Step 2/5: Installing Tailscale..."
+progress 2 "Installing Tailscale VPN..."
 
 if command -v tailscale &>/dev/null; then
     TS_STATUS=$(tailscale status --json 2>/dev/null | python3 -c "import sys,json; print(json.load(sys.stdin).get('BackendState',''))" 2>/dev/null || echo "")
     if [[ "$TS_STATUS" == "Running" ]]; then
         TS_IP=$(tailscale ip -4 2>/dev/null || echo "unknown")
-        info "Tailscale already running. IP: ${TS_IP}"
+        action "${GREEN}✓${NC} Tailscale already running (IP: ${TS_IP})"
     else
-        info "Tailscale installed but not connected."
+        action "Tailscale installed but not connected"
     fi
 else
-    curl -fsSL https://tailscale.com/install.sh 2>/dev/null | sh > /dev/null 2>&1
+    spin "Downloading Tailscale" bash -c 'curl -fsSL https://tailscale.com/install.sh 2>/dev/null | sh > /dev/null 2>&1'
 fi
 
 # Check if already authenticated
 TS_STATUS=$(tailscale status --json 2>/dev/null | python3 -c "import sys,json; print(json.load(sys.stdin).get('BackendState',''))" 2>/dev/null || echo "")
 
 if [[ "$TS_STATUS" != "Running" ]]; then
+    # Tailscale login is interactive — temporarily hide the progress bar
+    echo ""
     echo ""
     echo -e "  ${BOLD}Tailscale needs to be authenticated.${NC}"
     echo "  A login URL will appear — open it in your browser to connect."
     echo ""
     tailscale up
     echo ""
+    # Reset progress bar state so it redraws cleanly
+    _BAR_DRAWN=false
+    progress 2 "Tailscale connected"
 fi
 
 # Get Tailscale IP
 TS_IP=$(tailscale ip -4 2>/dev/null || echo "")
 
 if [[ -n "$TS_IP" ]]; then
-    log "Tailscale connected. VPN IP: ${TS_IP}"
+    action "${GREEN}✓${NC} Tailscale VPN connected (IP: ${TS_IP})"
 
     # Lock down SSH to Tailscale only
-    # First, check if the Tailscale interface exists for UFW
     if ufw status | grep -q "Status: active" 2>/dev/null; then
-        # Allow SSH on Tailscale interface
-        ufw allow in on tailscale0 to any port 22 > /dev/null 2>&1 || true
-
-        # Remove public SSH access
-        ufw delete allow ssh > /dev/null 2>&1 || true
-        ufw delete allow 22/tcp > /dev/null 2>&1 || true
-        ufw delete allow OpenSSH > /dev/null 2>&1 || true
-
-        info "SSH now only accessible via Tailscale (${TS_IP}:22)"
-        warn "Use 'ssh root@${TS_IP}' to connect from now on."
+        quiet ufw allow in on tailscale0 to any port 22 || true
+        quiet ufw delete allow ssh || true
+        quiet ufw delete allow 22/tcp || true
+        quiet ufw delete allow OpenSSH || true
+        action "${GREEN}✓${NC} SSH locked to Tailscale only (${TS_IP}:22)"
     fi
 else
-    warn "Could not get Tailscale IP. SSH lockdown skipped."
-    warn "Run 'tailscale up' manually, then re-run this script."
+    action "${YELLOW}!${NC} Could not get Tailscale IP — SSH lockdown skipped"
 fi
 
 # ═════════════════════════════════════════════
 # Step 3: LiteLLM API Proxy with Budget
 # ═════════════════════════════════════════════
-log "Step 3/5: Setting up LiteLLM API proxy (budget: \$${LITELLM_BUDGET}/month)..."
+progress 3 "Setting up LiteLLM API proxy..."
 
-# Install Python and pip if needed
-apt-get install -y -qq python3-pip python3-venv > /dev/null 2>&1
-
-# Create a dedicated venv for LiteLLM
 LITELLM_DIR="/opt/litellm"
-mkdir -p "$LITELLM_DIR"
 
-if [[ ! -d "${LITELLM_DIR}/venv" ]]; then
-    python3 -m venv "${LITELLM_DIR}/venv"
-fi
+if systemctl is-active litellm > /dev/null 2>&1 && [[ -f "${LITELLM_DIR}/config.yaml" ]]; then
+    # LiteLLM already set up by install.sh — just update budget if changed
+    action "${GREEN}✓${NC} LiteLLM already running (installed by install.sh)"
 
-"${LITELLM_DIR}/venv/bin/pip" install --quiet --upgrade litellm[proxy] 2>&1 | tail -1 || true
+    if [[ -n "$LITELLM_BUDGET" ]]; then
+        sed -i "s|max_budget:.*|max_budget: ${LITELLM_BUDGET}|" "${LITELLM_DIR}/config.yaml"
+        spin "Updating LiteLLM budget to \$${LITELLM_BUDGET}/month" systemctl restart litellm
+    fi
 
-# Generate a proxy key for internal use
-LITELLM_MASTER_KEY="sk-litellm-$(openssl rand -hex 16)"
+    # Read existing master key from config
+    LITELLM_MASTER_KEY=$(grep 'master_key:' "${LITELLM_DIR}/config.yaml" 2>/dev/null | awk '{print $2}' | tr -d '"' || echo "")
+else
+    # Fresh LiteLLM install (for upgrades from older installs without LiteLLM in install.sh)
+    spin "Installing Python venv" apt-get install -y -qq python3-pip python3-venv
 
-# Write LiteLLM config
-cat > "${LITELLM_DIR}/config.yaml" <<LITECFG
+    mkdir -p "$LITELLM_DIR"
+
+    if [[ ! -d "${LITELLM_DIR}/venv" ]]; then
+        spin "Creating LiteLLM virtualenv" python3 -m venv "${LITELLM_DIR}/venv"
+    fi
+
+    spin "Installing LiteLLM" bash -c "${LITELLM_DIR}/venv/bin/pip install --quiet --upgrade 'litellm[proxy]'"
+
+    LITELLM_MASTER_KEY="sk-litellm-$(openssl rand -hex 16)"
+
+    cat > "${LITELLM_DIR}/config.yaml" <<LITECFG
 model_list:
   - model_name: "anthropic/claude-sonnet-4-5-20250929"
     litellm_params:
@@ -234,10 +335,9 @@ litellm_settings:
   drop_params: true
 LITECFG
 
-chmod 600 "${LITELLM_DIR}/config.yaml"
+    chmod 600 "${LITELLM_DIR}/config.yaml"
 
-# Create systemd service for LiteLLM
-cat > /etc/systemd/system/litellm.service <<LITESVC
+    cat > /etc/systemd/system/litellm.service <<LITESVC
 [Unit]
 Description=LiteLLM API Proxy
 After=network.target
@@ -255,96 +355,70 @@ StandardError=journal
 WantedBy=multi-user.target
 LITESVC
 
-systemctl daemon-reload
-systemctl enable litellm > /dev/null 2>&1
-systemctl restart litellm
+    quiet systemctl daemon-reload
+    quiet systemctl enable litellm
+    spin "Starting LiteLLM" systemctl restart litellm
 
-# Wait for LiteLLM to start
-sleep 3
-if systemctl is-active litellm > /dev/null 2>&1; then
-    info "LiteLLM proxy running on 127.0.0.1:${LITELLM_PORT}"
-else
-    warn "LiteLLM may still be starting. Check: journalctl -u litellm -f"
-fi
-
-# Update OpenClaw to use LiteLLM proxy instead of direct Anthropic
-# Replace the Anthropic API key in .env with the LiteLLM proxy key
-# and point to localhost
-if [[ -f "${OCLAW_HOME}/.env" ]]; then
-    # Back up current .env
-    cp "${OCLAW_HOME}/.env" "${OCLAW_HOME}/.env.bak.$(date +%Y%m%d%H%M%S)"
-
-    # Update to use LiteLLM
-    sed -i "s|^ANTHROPIC_API_KEY=.*|ANTHROPIC_API_KEY=${LITELLM_MASTER_KEY}|" "${OCLAW_HOME}/.env"
-
-    # Add LiteLLM base URL if not present
-    if ! grep -q '^ANTHROPIC_BASE_URL=' "${OCLAW_HOME}/.env" 2>/dev/null; then
-        echo "ANTHROPIC_BASE_URL=http://127.0.0.1:${LITELLM_PORT}" >> "${OCLAW_HOME}/.env"
+    sleep 3
+    if systemctl is-active litellm > /dev/null 2>&1; then
+        action "${GREEN}✓${NC} LiteLLM proxy running on 127.0.0.1:${LITELLM_PORT}"
     else
-        sed -i "s|^ANTHROPIC_BASE_URL=.*|ANTHROPIC_BASE_URL=http://127.0.0.1:${LITELLM_PORT}|" "${OCLAW_HOME}/.env"
+        action "${YELLOW}!${NC} LiteLLM may still be starting — check: journalctl -u litellm -f"
     fi
 
-    chown openclaw:openclaw "${OCLAW_HOME}/.env"
-fi
+    # Update OpenClaw .env to use LiteLLM proxy
+    if [[ -f "${OCLAW_HOME}/.env" ]]; then
+        cp "${OCLAW_HOME}/.env" "${OCLAW_HOME}/.env.bak.$(date +%Y%m%d%H%M%S)"
+        sed -i "s|^ANTHROPIC_API_KEY=.*|ANTHROPIC_API_KEY=${LITELLM_MASTER_KEY}|" "${OCLAW_HOME}/.env"
 
-info "OpenClaw now routes API calls through LiteLLM (budget-limited)."
+        if ! grep -q '^ANTHROPIC_BASE_URL=' "${OCLAW_HOME}/.env" 2>/dev/null; then
+            echo "ANTHROPIC_BASE_URL=http://127.0.0.1:${LITELLM_PORT}" >> "${OCLAW_HOME}/.env"
+        else
+            sed -i "s|^ANTHROPIC_BASE_URL=.*|ANTHROPIC_BASE_URL=http://127.0.0.1:${LITELLM_PORT}|" "${OCLAW_HOME}/.env"
+        fi
+
+        chown openclaw:openclaw "${OCLAW_HOME}/.env"
+    fi
+
+    action "${GREEN}✓${NC} OpenClaw routed through LiteLLM (budget: \$${LITELLM_BUDGET}/month)"
+fi
 
 # ═════════════════════════════════════════════
 # Step 4: Squid Egress Filtering
 # ═════════════════════════════════════════════
-log "Step 4/5: Setting up Squid egress proxy..."
+progress 4 "Setting up Squid egress proxy..."
 
-apt-get install -y -qq squid > /dev/null 2>&1
+spin "Installing Squid" apt-get install -y -qq squid
 
 # Back up original config
 cp /etc/squid/squid.conf /etc/squid/squid.conf.bak.$(date +%Y%m%d%H%M%S) 2>/dev/null || true
 
-# Create allowlist of domains the agent is allowed to reach
+action "Writing domain allowlist..."
+
+# NOTE: No comments or blank lines inside — Squid 6+ rejects them in ACL files
 cat > /etc/squid/allowed-domains.txt <<'DOMAINS'
-# AI API providers
 .anthropic.com
 .openai.com
-
-# WordPress plugin/theme repositories
+.telegram.org
+.t.me
+.discord.com
+.discord.gg
 .wordpress.org
 .w.org
-downloads.wordpress.org
-api.wordpress.org
-
-# Package managers (needed for updates)
 .packagist.org
 .getcomposer.org
-repo.packagist.org
-
-# Node.js packages (needed for OpenClaw updates)
 .npmjs.org
 .npmjs.com
-registry.npmjs.org
-
-# Ubuntu/Debian repos (needed for apt)
 .ubuntu.com
 .debian.org
-security.ubuntu.com
-
-# Let's Encrypt (SSL certificates)
 .letsencrypt.org
-acme-v02.api.letsencrypt.org
-
-# Tailscale coordination
 .tailscale.com
-
-# GitHub (for repo updates)
 .github.com
 .githubusercontent.com
-
-# Gravatar (WordPress avatars)
 .gravatar.com
-
-# WooCommerce
 .woocommerce.com
 DOMAINS
 
-# Write Squid config — only allow outbound to allowlisted domains
 cat > /etc/squid/squid.conf <<'SQUIDCFG'
 # OpenClaw egress filtering proxy
 # Only allows outbound HTTPS to allowlisted domains
@@ -381,14 +455,8 @@ connect_timeout 30 seconds
 read_timeout 60 seconds
 SQUIDCFG
 
-systemctl enable squid > /dev/null 2>&1
-systemctl restart squid
-
-if systemctl is-active squid > /dev/null 2>&1; then
-    info "Squid egress proxy running. Only allowlisted domains can be reached."
-else
-    warn "Squid may have issues. Check: systemctl status squid"
-fi
+quiet systemctl enable squid
+spin "Starting Squid proxy" systemctl restart squid
 
 # Configure the openclaw user to route through Squid
 PROXY_LINE="export http_proxy=http://127.0.0.1:${SQUID_PORT}"
@@ -408,79 +476,125 @@ fi
 # Add proxy env vars to systemd service
 if ! grep -q 'http_proxy' /etc/systemd/system/openclaw.service 2>/dev/null; then
     sed -i '/\[Service\]/a Environment="http_proxy=http://127.0.0.1:3128"\nEnvironment="https_proxy=http://127.0.0.1:3128"' /etc/systemd/system/openclaw.service
-    systemctl daemon-reload
+    quiet systemctl daemon-reload
 fi
 
-info "OpenClaw outbound traffic now filtered through Squid."
+action "${GREEN}✓${NC} Squid egress proxy running — outbound traffic filtered"
 
 # ═════════════════════════════════════════════
 # Step 5: wp-admin Lockdown
 # ═════════════════════════════════════════════
-log "Step 5/5: Locking down wp-admin..."
+progress 5 "Locking down wp-admin..."
 
-# Detect which web server is running
 if command -v nginx &>/dev/null && systemctl is-active nginx > /dev/null 2>&1; then
-    # Create an Nginx snippet that restricts wp-admin and wp-login
     NGINX_SNIPPET="/etc/nginx/snippets/wp-admin-restrict.conf"
 
     if [[ -n "$TS_IP" ]]; then
-        # Get the Tailscale subnet (usually 100.x.x.x/8)
         TS_SUBNET="100.64.0.0/10"
+        SERVER_PUBLIC_IP=$(curl -4 -s --connect-timeout 5 ifconfig.me 2>/dev/null || echo "")
+        PHP_V=$(php -r 'echo PHP_MAJOR_VERSION.".".PHP_MINOR_VERSION;' 2>/dev/null || echo "8.2")
 
+        action "Writing Nginx restriction snippet..."
         cat > "$NGINX_SNIPPET" <<NGINXSNIP
-# Restrict wp-admin and wp-login.php to Tailscale network only
+# Restrict wp-admin and wp-login.php to Tailscale + server's own IP
 location ~ ^/(wp-admin|wp-login\.php) {
     allow ${TS_SUBNET};
     allow 127.0.0.1;
+${SERVER_PUBLIC_IP:+    allow ${SERVER_PUBLIC_IP};}
     deny all;
 
     # Pass PHP requests
     location ~ \.php\$ {
         include snippets/fastcgi-php.conf;
-        fastcgi_pass unix:/run/php/php$(php -r 'echo PHP_MAJOR_VERSION.".".PHP_MINOR_VERSION;')-fpm.sock;
+        fastcgi_pass unix:/run/php/php${PHP_V}-fpm.sock;
         fastcgi_param SCRIPT_FILENAME \$document_root\$fastcgi_script_name;
         include fastcgi_params;
     }
 }
 NGINXSNIP
 
-        # Include the snippet in the WordPress Nginx config if not already included
+        # Make WordPress work when accessed via Tailscale IP
+        WP_TS_CONFIG="${WP_PATH}/wp-tailscale.php"
+        cat > "$WP_TS_CONFIG" <<'WPTSPHP'
+<?php
+/**
+ * Dynamic host detection for Tailscale access.
+ * Loaded from wp-config.php so wp-admin works via both public IP and Tailscale IP.
+ */
+if ( ! defined( 'ABSPATH' ) ) {
+    return;
+}
+$scheme = ( ! empty( $_SERVER['HTTPS'] ) && $_SERVER['HTTPS'] !== 'off' ) ? 'https' : 'http';
+$host   = $_SERVER['HTTP_HOST'] ?? $_SERVER['SERVER_NAME'] ?? '';
+if ( $host && preg_match( '/^100\./', $host ) ) {
+    // Accessing via Tailscale IP — override siteurl/home dynamically
+    define( 'WP_SITEURL', $scheme . '://' . $host );
+    define( 'WP_HOME',    $scheme . '://' . $host );
+}
+WPTSPHP
+        chown www-data:www-data "$WP_TS_CONFIG"
+
+        # Include the Tailscale snippet in wp-config.php if not already there
+        if [[ -f "${WP_PATH}/wp-config.php" ]] && ! grep -q 'wp-tailscale.php' "${WP_PATH}/wp-config.php" 2>/dev/null; then
+            sed -i "1a\\
+// Dynamic host for Tailscale access\\
+if ( file_exists( __DIR__ . '/wp-tailscale.php' ) ) { require_once __DIR__ . '/wp-tailscale.php'; }" "${WP_PATH}/wp-config.php"
+            action "WordPress configured for Tailscale IP access"
+        fi
+
+        # Add the Nginx snippet to the WordPress server block
         WP_NGINX_CONF="/etc/nginx/sites-available/wordpress"
-        if [[ -f "$WP_NGINX_CONF" ]] && ! grep -q "wp-admin-restrict" "$WP_NGINX_CONF" 2>/dev/null; then
-            # Insert the include before the closing brace of the server block
-            sed -i '/location = \/robots.txt/a \\n    include snippets/wp-admin-restrict.conf;' "$WP_NGINX_CONF"
+        if [[ -f "$WP_NGINX_CONF" ]]; then
+            # Add Tailscale IP to server_name if not already there
+            if ! grep -q "$TS_IP" "$WP_NGINX_CONF" 2>/dev/null; then
+                sed -i "s/server_name .*/& ${TS_IP};/" "$WP_NGINX_CONF"
+                sed -i 's/;;/;/g' "$WP_NGINX_CONF"
+            fi
+
+            # Include the wp-admin restriction snippet
+            if ! grep -q "wp-admin-restrict" "$WP_NGINX_CONF" 2>/dev/null; then
+                sed -i '/location = \/robots.txt/a \\n    include snippets/wp-admin-restrict.conf;' "$WP_NGINX_CONF"
+            fi
 
             if nginx -t > /dev/null 2>&1; then
-                systemctl reload nginx
-                info "wp-admin restricted to Tailscale network only."
+                spin "Reloading Nginx" systemctl reload nginx
+                action "${GREEN}✓${NC} wp-admin restricted to Tailscale network only"
             else
-                warn "Nginx config test failed. Reverting wp-admin restriction."
+                action "${RED}✗${NC} Nginx config test failed — reverting wp-admin restriction"
                 sed -i '/wp-admin-restrict/d' "$WP_NGINX_CONF"
+                sed -i "/${TS_IP}/d" "$WP_NGINX_CONF"
                 rm -f "$NGINX_SNIPPET"
             fi
         else
-            info "wp-admin restriction already configured or Nginx config not found at expected path."
+            action "${YELLOW}!${NC} Nginx config not found — skipping wp-admin lockdown"
         fi
     else
-        warn "Tailscale IP not available. Skipping wp-admin lockdown."
-        warn "Re-run after 'tailscale up' to apply wp-admin restrictions."
+        action "${YELLOW}!${NC} Tailscale IP not available — skipping wp-admin lockdown"
     fi
 else
-    info "Nginx not detected. If using Apache, add Tailscale IP restriction to .htaccess manually."
+    action "${YELLOW}!${NC} Nginx not detected — add Tailscale IP restriction to .htaccess manually"
 fi
 
 # ═════════════════════════════════════════════
-# Restart OpenClaw with all changes
+# Step 6: Restart OpenClaw
 # ═════════════════════════════════════════════
-log "Restarting OpenClaw with hardened configuration..."
-systemctl restart openclaw
+progress 6 "Restarting OpenClaw with hardened config..."
+
+spin "Restarting OpenClaw" systemctl restart openclaw
 
 sleep 3
 OPENCLAW_STATUS=$(systemctl is-active openclaw 2>/dev/null || echo "unknown")
 
+if [[ "$OPENCLAW_STATUS" == "active" ]]; then
+    action "${GREEN}✓${NC} OpenClaw restarted successfully"
+else
+    action "${YELLOW}!${NC} OpenClaw status: ${OPENCLAW_STATUS} — check: journalctl -u openclaw -n 30"
+fi
+
 # ═════════════════════════════════════════════
 # Summary
 # ═════════════════════════════════════════════
+echo ""
 echo ""
 echo ""
 echo -e "${BOLD}════════════════════════════════════════════════════${NC}"
@@ -516,6 +630,7 @@ echo -e "  ${BOLD}wp-admin${NC}"
 if [[ -n "$TS_IP" ]]; then
 echo "    Access:            Tailscale network only"
 echo "    URL:               http://${TS_IP}/wp-admin"
+echo "    Note:              WordPress auto-detects Tailscale IP (no redirect)"
 else
 echo "    Access:            public (lock down after Tailscale connects)"
 fi
@@ -543,7 +658,7 @@ Applied: $(date)
 
 SSH: key-only (password disabled)
 Tailscale IP: ${TS_IP:-not connected}
-LiteLLM Master Key: ${LITELLM_MASTER_KEY}
+LiteLLM Master Key: ${LITELLM_MASTER_KEY:-already set by install.sh}
 LiteLLM Config: ${LITELLM_DIR}/config.yaml
 LiteLLM Budget: \$${LITELLM_BUDGET}/month
 Squid Allowlist: /etc/squid/allowed-domains.txt
@@ -554,4 +669,5 @@ HARDCREDS
 
 chmod 600 /root/setup-credentials.txt
 info "Hardening details appended to /root/setup-credentials.txt"
+info "Full log: cat ${HARDEN_LOG}"
 echo ""

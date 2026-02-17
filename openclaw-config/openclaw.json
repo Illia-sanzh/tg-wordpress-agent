@@ -9,25 +9,29 @@
     "gateway": {
         "port": 18789,
         "bind": "loopback",
-        "mode": "local"
+        "mode": "local",
+        "auth": {
+            "mode": "token",
+            "token": "GENERATE_WITH_openssl_rand_-hex_24"
+        }
     },
     "channels": {
         "telegram": {
             "enabled": true,
             "botToken": "YOUR_TELEGRAM_BOT_TOKEN_HERE",
-            "dmPolicy": "pairing",
+            "dmPolicy": "allowlist",
             "allowFrom": ["YOUR_TELEGRAM_USER_ID"]
         }
     },
-    "mcpServers": {
-        "wordpress": {
-            "command": "npx",
-            "args": ["-y", "@automattic/mcp-wordpress-remote@latest"],
-            "env": {
-                "WP_API_URL": "http://YOUR_DOMAIN/wp-json/mcp/mcp-adapter-default-server",
-                "WP_API_USERNAME": "YOUR_WP_ADMIN_USER",
-                "WP_API_PASSWORD": "YOUR_WP_APP_PASSWORD"
-            }
+    "tools": {
+        "elevated": {
+            "enabled": true
         }
+    },
+    "env": {
+        "WP_PATH": "/var/www/html",
+        "WP_SITE_URL": "http://YOUR_DOMAIN",
+        "WP_APP_USER": "YOUR_WP_ADMIN_USER",
+        "WP_APP_PASSWORD": "YOUR_WP_APP_PASSWORD"
     }
 }
