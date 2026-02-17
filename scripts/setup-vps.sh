@@ -142,6 +142,25 @@ echo ""
 export DEBIAN_FRONTEND=noninteractive
 
 # ─────────────────────────────────────────────
+# Phase 0: Ensure swap exists (prevents OOM on small VPS)
+# ─────────────────────────────────────────────
+
+if ! swapon --show | grep -q '/'; then
+    echo -e "  ${CYAN}Creating swap file (prevents out-of-memory crashes)...${NC}"
+    fallocate -l 2G /swapfile 2>/dev/null || dd if=/dev/zero of=/swapfile bs=1M count=2048 status=none
+    chmod 600 /swapfile
+    mkswap /swapfile > /dev/null 2>&1
+    swapon /swapfile
+    if ! grep -q '/swapfile' /etc/fstab 2>/dev/null; then
+        echo '/swapfile none swap sw 0 0' >> /etc/fstab
+    fi
+    echo -e "  ${GREEN}✓${NC} 2GB swap enabled"
+else
+    echo -e "  ${GREEN}✓${NC} Swap already active"
+fi
+echo ""
+
+# ─────────────────────────────────────────────
 # Phase 1: System Packages
 # ─────────────────────────────────────────────
 
@@ -149,30 +168,39 @@ progress 1 "Installing system packages..."
 
 if [[ "$EXISTING_WORDPRESS" == "true" ]]; then
     spin "Updating package lists" apt-get update -qq
-    spin "Installing base tools" apt-get install -y -qq curl wget unzip git
+    spin "Installing base tools" apt-get install -y -qq curl wget unzip git software-properties-common
 else
     spin "Updating package lists" apt-get update -qq
+    spin "Installing base tools" apt-get install -y -qq curl wget unzip git software-properties-common
 
-    spin "Installing Nginx + PHP + MariaDB" apt-get install -y -qq \
+    # Add PHP repository — Ubuntu 22.04 only has PHP 8.1 by default
+    if ! apt-cache show php8.3-fpm > /dev/null 2>&1 && ! apt-cache show php8.2-fpm > /dev/null 2>&1; then
+        action "Adding PHP repository (needed for PHP 8.2+)..."
+        spin "Adding ondrej/php PPA" bash -c 'add-apt-repository -y ppa:ondrej/php && apt-get update -qq'
+    fi
+
+    # Detect best available PHP version
+    PHP_V=""
+    for v in 8.3 8.2 8.1; do
+        if apt-cache show "php${v}-fpm" > /dev/null 2>&1; then
+            PHP_V="$v"
+            break
+        fi
+    done
+
+    if [[ -z "$PHP_V" ]]; then
+        err "No supported PHP version (8.1+) found. Check your OS version."
+    fi
+
+    action "Installing web server & PHP ${PHP_V} (this is the longest step)..."
+    spin "Installing Nginx + PHP ${PHP_V} + MariaDB" apt-get install -y -qq \
         nginx \
         mariadb-server \
-        php8.3-fpm php8.3-mysql php8.3-xml php8.3-mbstring php8.3-curl \
-        php8.3-zip php8.3-gd php8.3-intl php8.3-imagick php8.3-bcmath \
-        php8.3-soap php8.3-opcache \
-        curl wget unzip git \
+        "php${PHP_V}-fpm" "php${PHP_V}-mysql" "php${PHP_V}-xml" "php${PHP_V}-mbstring" "php${PHP_V}-curl" \
+        "php${PHP_V}-zip" "php${PHP_V}-gd" "php${PHP_V}-intl" "php${PHP_V}-imagick" "php${PHP_V}-bcmath" \
+        "php${PHP_V}-soap" "php${PHP_V}-opcache" \
         certbot python3-certbot-nginx \
-        ufw fail2ban || {
-        action "PHP 8.3 unavailable, trying 8.2..."
-        spin "Installing Nginx + PHP 8.2 + MariaDB" apt-get install -y -qq \
-            nginx \
-            mariadb-server \
-            php8.2-fpm php8.2-mysql php8.2-xml php8.2-mbstring php8.2-curl \
-            php8.2-zip php8.2-gd php8.2-intl php8.2-imagick php8.2-bcmath \
-            php8.2-soap php8.2-opcache \
-            curl wget unzip git \
-            certbot python3-certbot-nginx \
-            ufw fail2ban
-    }
+        ufw fail2ban
 
     PHP_VERSION=$(php -r 'echo PHP_MAJOR_VERSION.".".PHP_MINOR_VERSION;')
     action "${GREEN}✓${NC} System packages installed (PHP ${PHP_VERSION})"
