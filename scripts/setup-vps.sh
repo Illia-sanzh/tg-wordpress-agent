@@ -30,6 +30,44 @@ _BAR_DRAWN=false
 INSTALL_LOG="/tmp/openclaw-install.log"
 : > "$INSTALL_LOG"
 
+# ── Crash handler — show last log lines on failure ──
+on_error() {
+    local exit_code=$?
+    echo ""
+    echo ""
+    echo -e "${RED}${BOLD}  Installation failed (exit code ${exit_code})${NC}"
+    echo ""
+    if [[ -s "$INSTALL_LOG" ]]; then
+        echo -e "${YELLOW}  Last 25 lines of ${INSTALL_LOG}:${NC}"
+        echo -e "${DIM}"
+        tail -25 "$INSTALL_LOG" 2>/dev/null | sed 's/^/    /'
+        echo -e "${NC}"
+    fi
+    echo -e "  Full log: ${CYAN}cat ${INSTALL_LOG}${NC}"
+    echo ""
+}
+trap on_error ERR
+
+# ── Wait for apt lock (fresh VPS runs unattended-upgrades on boot) ──
+wait_for_apt() {
+    local waited=0
+    while fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 || \
+          fuser /var/lib/apt/lists/lock >/dev/null 2>&1 || \
+          fuser /var/lib/dpkg/lock >/dev/null 2>&1; do
+        if [[ $waited -eq 0 ]]; then
+            action "Waiting for system package manager to finish..."
+        fi
+        sleep 3
+        waited=$((waited + 3))
+        if [[ $waited -ge 180 ]]; then
+            err "apt lock held for over 3 minutes. Try: kill the unattended-upgrades process and re-run."
+        fi
+    done
+    if [[ $waited -gt 0 ]]; then
+        action "Package manager is now free (waited ${waited}s)"
+    fi
+}
+
 progress() {
     local step=$1
     local action="$2"
@@ -64,7 +102,8 @@ spin() {
     shift
     action "⠋ ${msg}"
 
-    "$@" >> "$INSTALL_LOG" 2>&1 &
+    # Run in subshell to isolate from set -e
+    ( set +e; "$@" >> "$INSTALL_LOG" 2>&1 ) &
     local pid=$!
 
     local frames=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
@@ -75,12 +114,18 @@ spin() {
         sleep 0.15
     done
 
+    # Temporarily disable set -e so we can capture the exit code
+    set +e
     wait "$pid"
     local rc=$?
+    set -e
+
     if [[ $rc -eq 0 ]]; then
         action "${GREEN}✓${NC} ${msg}"
     else
-        action "${RED}✗${NC} ${msg}"
+        action "${RED}✗${NC} ${msg} — check ${INSTALL_LOG}"
+        echo "" >> "$INSTALL_LOG"
+        echo "=== FAILED: ${msg} (exit code ${rc}) ===" >> "$INSTALL_LOG"
     fi
     return $rc
 }
@@ -165,6 +210,12 @@ echo ""
 # ─────────────────────────────────────────────
 
 progress 1 "Installing system packages..."
+
+# Wait for any running apt/dpkg processes (e.g. unattended-upgrades on fresh VPS)
+wait_for_apt
+
+# Fix any interrupted dpkg from a previous failed run
+dpkg --configure -a >> "$INSTALL_LOG" 2>&1 || true
 
 if [[ "$EXISTING_WORDPRESS" == "true" ]]; then
     spin "Updating package lists" apt-get update -qq
