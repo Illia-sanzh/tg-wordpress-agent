@@ -452,13 +452,20 @@ spin "Installing pnpm" npm install -g pnpm || true
 
 # Install Podman + podman-compose (needed for LiteLLM/Squid containers)
 if ! command -v podman &>/dev/null; then
-    spin "Installing Podman" apt-get install -y -qq podman python3-pip
+    spin "Installing Podman" apt-get install -y -qq podman
 else
     action "${GREEN}✓${NC} Podman already installed ($(podman --version | awk '{print $3}'))"
 fi
 
 if ! command -v podman-compose &>/dev/null; then
-    spin "Installing podman-compose" pip3 install --quiet podman-compose
+    # Try apt first (available on Ubuntu 22.04+); fall back to pipx for older setups
+    if apt-cache show podman-compose > /dev/null 2>&1; then
+        spin "Installing podman-compose" apt-get install -y -qq podman-compose
+    else
+        spin "Installing pipx + podman-compose" bash -c 'apt-get install -y -qq pipx && pipx install podman-compose && pipx ensurepath'
+        # Add pipx bin to PATH for this session so subsequent commands find it
+        export PATH="$PATH:/root/.local/bin"
+    fi
 else
     action "${GREEN}✓${NC} podman-compose already installed"
 fi
