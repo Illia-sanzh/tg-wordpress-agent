@@ -295,9 +295,9 @@ else
         sleep 5
     fi
 
-    # Verify LiteLLM health
-    if curl -sf http://127.0.0.1:4000/health > /dev/null 2>&1; then
-        action "${GREEN}✓${NC} LiteLLM proxy responding (http://127.0.0.1:4000)"
+    # Verify LiteLLM health (use static bridge IP — port mapping is broken for internal networks)
+    if curl -sf http://192.168.100.10:4000/health/readiness > /dev/null 2>&1; then
+        action "${GREEN}✓${NC} LiteLLM proxy responding (http://192.168.100.10:4000)"
     else
         warn "LiteLLM not responding — check: podman logs openclaw-litellm"
     fi
@@ -311,6 +311,15 @@ else
     fi
 
     action "${GREEN}✓${NC} Container stack verified — LiteLLM + Squid"
+
+    # UFW sets FORWARD policy to DROP which blocks Podman containers from reaching
+    # the internet. Ensure forwarding rules are in place (idempotent).
+    if iptables -L FORWARD -n 2>/dev/null | grep -q "^Chain FORWARD (policy DROP)"; then
+        iptables -C FORWARD -s 10.89.0.0/16 -j ACCEPT 2>/dev/null || iptables -I FORWARD -s 10.89.0.0/16 -j ACCEPT
+        iptables -C FORWARD -d 10.89.0.0/16 -j ACCEPT 2>/dev/null || iptables -I FORWARD -d 10.89.0.0/16 -j ACCEPT
+        mkdir -p /etc/iptables && iptables-save > /etc/iptables/rules.v4
+        action "${GREEN}✓${NC} Podman container forwarding enabled (UFW FORWARD was DROP)"
+    fi
 fi
 
 # Ensure proxy env vars are present in openclaw's .env (idempotent)
@@ -319,10 +328,16 @@ if ! grep -q '^http_proxy=' "${OCLAW_HOME}/.env" 2>/dev/null; then
     echo "https_proxy=http://127.0.0.1:${SQUID_PORT}" >> "${OCLAW_HOME}/.env"
     echo "GLOBAL_AGENT_HTTP_PROXY=http://127.0.0.1:${SQUID_PORT}" >> "${OCLAW_HOME}/.env"
 fi
+# Ensure NO_PROXY bypasses localhost so LiteLLM (:4000) is reached directly (idempotent)
+if ! grep -q '^NO_PROXY=' "${OCLAW_HOME}/.env" 2>/dev/null; then
+    echo "NO_PROXY=127.0.0.1,localhost,::1,192.168.100.10" >> "${OCLAW_HOME}/.env"
+    echo "no_proxy=127.0.0.1,localhost,::1,192.168.100.10" >> "${OCLAW_HOME}/.env"
+    echo "GLOBAL_AGENT_NO_PROXY=127.0.0.1,localhost,192.168.100.10" >> "${OCLAW_HOME}/.env"
+fi
 
 # Ensure ANTHROPIC_BASE_URL points to LiteLLM (idempotent)
 if ! grep -q '^ANTHROPIC_BASE_URL=' "${OCLAW_HOME}/.env" 2>/dev/null; then
-    echo "ANTHROPIC_BASE_URL=http://127.0.0.1:4000" >> "${OCLAW_HOME}/.env"
+    echo "ANTHROPIC_BASE_URL=http://192.168.100.10:4000" >> "${OCLAW_HOME}/.env"
     action "Added ANTHROPIC_BASE_URL to openclaw .env"
 fi
 
@@ -547,7 +562,12 @@ RestrictSUIDSGID=yes
 RemoveIPC=yes
 DROPIN
 
-# Resolve the global-agent bootstrap path and substitute it into the drop-in
+# Resolve the global-agent bootstrap path and substitute it into the drop-in.
+# If dist/index.js is missing (broken v3 install), reinstall pinned to v2.
+_GA_DIST="$(npm root -g 2>/dev/null)/global-agent/dist/index.js"
+if [[ ! -f "$_GA_DIST" ]]; then
+    spin "Reinstalling global-agent@2 (dist/ was missing)" npm install -g global-agent@2
+fi
 _GA_PATH="$(npm root -g 2>/dev/null)/global-agent/bootstrap"
 sed -i "s|__GLOBAL_AGENT_PATH__|${_GA_PATH}|" "$DROPIN_FILE"
 

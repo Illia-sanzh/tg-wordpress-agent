@@ -719,9 +719,15 @@ useradd -r -m -s /bin/bash openclaw 2>/dev/null || true
 # Install OpenClaw
 spin "Installing OpenClaw via npm" npm install -g openclaw@latest
 
-# Install global-agent so Node.js HTTP/HTTPS honours http_proxy env vars
-spin "Installing global-agent (Node.js proxy bootstrap)" npm install -g global-agent
+# Install global-agent so Node.js HTTP/HTTPS honours http_proxy env vars.
+# Pin to v2 — v3 is a TypeScript rewrite that sometimes publishes without dist/.
+spin "Installing global-agent (Node.js proxy bootstrap)" npm install -g global-agent@2
 GLOBAL_AGENT_BOOTSTRAP="$(npm root -g)/global-agent/bootstrap"
+# Sanity-check: dist/index.js must exist or the --require preload will crash Node.
+if [[ ! -f "$(npm root -g)/global-agent/dist/index.js" ]]; then
+    warn "global-agent dist/ missing after install — retrying..."
+    npm install -g global-agent@2 --force >> "$INSTALL_LOG" 2>&1 || true
+fi
 
 # ─────────────────────────────────────────────
 # Container stack: LiteLLM (API budget proxy) + Squid (egress filter)
@@ -730,6 +736,20 @@ action "Setting up container stack (LiteLLM + Squid)..."
 
 DOCKER_DIR="/home/openclaw/openclaw-docker"
 mkdir -p "$DOCKER_DIR"
+
+# If the internal network exists with a different subnet, tear it down first.
+# (Re-runs after the static-IP migration would otherwise fail to recreate networks.)
+_INT_NET="openclaw-docker_openclaw-internal"
+if podman network exists "$_INT_NET" 2>/dev/null; then
+    _CURRENT_SUBNET=$(podman network inspect "$_INT_NET" 2>/dev/null \
+        | grep '"subnet"' | head -1 | grep -oP '"\K[^"]+' | head -1)
+    if [[ "$_CURRENT_SUBNET" != "192.168.100.0/24" ]]; then
+        action "Migrating container networks to static-IP subnet..."
+        bash -c "cd '${DOCKER_DIR}' && podman-compose down --remove-orphans" >> "$INSTALL_LOG" 2>&1 || true
+        podman network rm "$_INT_NET" >> "$INSTALL_LOG" 2>&1 || true
+        podman network rm "openclaw-docker_openclaw-external" >> "$INSTALL_LOG" 2>&1 || true
+    fi
+fi
 
 # Generate LiteLLM master key — OpenClaw uses this instead of the real API key.
 # Real key lives only inside the LiteLLM container.
@@ -748,12 +768,15 @@ version: "3.8"
 networks:
   openclaw-internal:
     internal: true       # no internet route — LiteLLM is trapped here
+    ipam:
+      config:
+        - subnet: 192.168.100.0/24   # fixed subnet so LiteLLM always gets 192.168.100.10
   openclaw-external:
     driver: bridge       # internet access — Squid only
 
 services:
   openclaw-squid:
-    image: ubuntu/squid:latest
+    image: docker.io/ubuntu/squid:latest
     container_name: openclaw-squid
     networks:
       - openclaw-internal   # reachable from LiteLLM
@@ -769,7 +792,9 @@ services:
     image: ghcr.io/berriai/litellm:main-latest
     container_name: openclaw-litellm
     networks:
-      - openclaw-internal   # no direct internet — all traffic via Squid
+      openclaw-internal:
+        ipv4_address: 192.168.100.10  # static IP — host reaches it at this address directly
+                                       # (Podman DNAT is broken for internal networks)
     environment:
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
       - LITELLM_MASTER_KEY=${LITELLM_MASTER_KEY}
@@ -779,8 +804,6 @@ services:
       - ./litellm-config.yaml:/app/config.yaml:ro
       - litellm-data:/app/.litellm
     command: --config /app/config.yaml --port 4000 --num_workers 1
-    ports:
-      - "127.0.0.1:4000:4000"
     depends_on:
       - openclaw-squid
     restart: unless-stopped
@@ -810,9 +833,10 @@ cat > "${DOCKER_DIR}/squid.conf" <<'SQUIDCONF'
 # OpenClaw egress filter — containerized
 http_port 3128
 
+acl localnet src 127.0.0.0/8    # host loopback — OpenClaw connects from 127.0.0.1
 acl localnet src 10.0.0.0/8
 acl localnet src 172.16.0.0/12
-acl localnet src 192.168.0.0/16
+acl localnet src 192.168.0.0/16  # covers static LiteLLM subnet 192.168.100.0/24
 acl SSL_ports port 443
 acl Safe_ports port 80
 acl Safe_ports port 443
@@ -824,8 +848,8 @@ http_access deny CONNECT !SSL_ports
 http_access allow localnet allowed_domains
 http_access deny all
 
-access_log /dev/stdout
-cache_log /dev/stderr
+access_log stdio:/dev/stdout
+cache_log stdio:/dev/stderr
 cache deny all
 
 connect_timeout 30 seconds
@@ -978,11 +1002,15 @@ progress 9 "Starting OpenClaw service..."
 cat > /home/openclaw/.env <<ENV
 # LiteLLM proxy — master key (real Anthropic API key is inside the container only)
 ANTHROPIC_API_KEY=${LITELLM_MASTER_KEY}
-ANTHROPIC_BASE_URL=http://127.0.0.1:4000
-# Egress proxy — routes all Node.js HTTP/HTTPS through Squid's allowlist
+ANTHROPIC_BASE_URL=http://192.168.100.10:4000
+# Egress proxy — routes external Node.js HTTP/HTTPS through Squid's allowlist
 http_proxy=http://127.0.0.1:3128
 https_proxy=http://127.0.0.1:3128
 GLOBAL_AGENT_HTTP_PROXY=http://127.0.0.1:3128
+# Bypass proxy for LiteLLM (direct bridge IP) and localhost
+NO_PROXY=127.0.0.1,localhost,::1,192.168.100.10
+no_proxy=127.0.0.1,localhost,::1,192.168.100.10
+GLOBAL_AGENT_NO_PROXY=127.0.0.1,localhost,192.168.100.10
 # Node.js: bootstrap global-agent proxy + V8 heap limit
 NODE_OPTIONS=--require ${GLOBAL_AGENT_BOOTSTRAP} --max-old-space-size=1024
 # Bot & WordPress
@@ -1002,6 +1030,9 @@ if ! grep -qF 'source ~/.env' /home/openclaw/.bashrc 2>/dev/null; then
     echo 'set -a; source ~/.env; set +a' >> /home/openclaw/.bashrc
 fi
 
+# Resolve podman-compose binary path (apt installs to /usr/bin, pipx to ~/.local/bin)
+PODMAN_COMPOSE_BIN="$(command -v podman-compose)"
+
 # Create systemd service for the container stack (LiteLLM + Squid)
 cat > /etc/systemd/system/openclaw-containers.service <<CONTAINERS
 [Unit]
@@ -1013,8 +1044,8 @@ Wants=network-online.target
 Type=oneshot
 RemainAfterExit=yes
 WorkingDirectory=/home/openclaw/openclaw-docker
-ExecStart=/usr/local/bin/podman-compose up -d
-ExecStop=/usr/local/bin/podman-compose down
+ExecStart=${PODMAN_COMPOSE_BIN} up -d
+ExecStop=${PODMAN_COMPOSE_BIN} down
 TimeoutStartSec=120
 
 [Install]
@@ -1063,6 +1094,20 @@ if [[ "$EXISTING_WORDPRESS" != "true" ]]; then
     quiet ufw allow ssh
     quiet ufw allow 'Nginx Full'
     quiet ufw --force enable
+
+    # UFW sets FORWARD policy to DROP, which blocks Podman containers from reaching
+    # the internet. Add persistent iptables rules to allow Podman bridge forwarding.
+    spin "Allowing Podman container forwarding through firewall" bash -c '
+        iptables -C FORWARD -s 10.89.0.0/16 -j ACCEPT 2>/dev/null || iptables -I FORWARD -s 10.89.0.0/16 -j ACCEPT
+        iptables -C FORWARD -d 10.89.0.0/16 -j ACCEPT 2>/dev/null || iptables -I FORWARD -d 10.89.0.0/16 -j ACCEPT
+        mkdir -p /etc/iptables
+        iptables-save > /etc/iptables/rules.v4
+    '
+    # Install iptables-persistent so rules survive reboots
+    if ! dpkg -l iptables-persistent &>/dev/null; then
+        DEBIAN_FRONTEND=noninteractive spin "Installing iptables-persistent" \
+            apt-get install -y -qq iptables-persistent
+    fi
     quiet systemctl enable fail2ban
     quiet systemctl start fail2ban
     action "${GREEN}✓${NC} Firewall configured"
