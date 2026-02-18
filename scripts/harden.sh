@@ -597,15 +597,21 @@ if [[ "$LITELLM_CONFIGURED" != "true" ]]; then
         warn "ANTHROPIC_API_KEY not found in ${OCLAW_HOME}/.env — skipping LiteLLM setup"
         warn "Set ANTHROPIC_API_KEY and re-run harden.sh to enable API budget limits"
     else
-        # Ensure pip3 is available (not installed by default on Ubuntu 24.04 minimal)
-        if ! command -v pip3 &>/dev/null; then
-            spin "Installing pip3" apt-get install -y -qq python3-pip
+        # Install LiteLLM in a virtual environment.
+        # Ubuntu 24.04 uses PEP 668 — pip cannot uninstall apt-managed packages like
+        # typing_extensions, so global pip installs fail. A venv is the correct fix:
+        # it is fully isolated from system packages, no conflicts possible.
+        if ! command -v python3 &>/dev/null; then
+            spin "Installing python3" apt-get install -y -qq python3 python3-venv
+        elif ! python3 -m venv --help > /dev/null 2>&1; then
+            spin "Installing python3-venv" apt-get install -y -qq python3-venv
         fi
 
-        # --break-system-packages is required on Ubuntu 24.04+ which uses PEP 668
-        # (prevents accidental overwrites of distro packages; safe here since we're root)
-        spin "Installing LiteLLM" pip3 install -q --break-system-packages 'litellm[proxy]'
-        LITELLM_BIN="$(which litellm 2>/dev/null || python3 -c "import sys; print(sys.prefix+'/bin/litellm')" 2>/dev/null || echo '/usr/local/bin/litellm')"
+        LITELLM_VENV="${OCLAW_HOME}/litellm-venv"
+        spin "Creating LiteLLM virtualenv" python3 -m venv "$LITELLM_VENV"
+        spin "Installing LiteLLM" "${LITELLM_VENV}/bin/pip" install -q 'litellm[proxy]'
+        LITELLM_BIN="${LITELLM_VENV}/bin/litellm"
+        chown -R openclaw:openclaw "$LITELLM_VENV"
 
         # Generate proxy master key — this replaces the real API key in openclaw's env.
         # OpenClaw sends this key to LiteLLM; LiteLLM validates it, tracks spend, and
@@ -668,7 +674,7 @@ User=openclaw
 Group=openclaw
 WorkingDirectory=/home/openclaw
 EnvironmentFile=/home/openclaw/litellm.env
-Environment="PATH=/usr/local/bin:/usr/bin:/bin"
+Environment="PATH=${OCLAW_HOME}/litellm-venv/bin:/usr/local/bin:/usr/bin:/bin"
 Environment="http_proxy=http://127.0.0.1:3128"
 Environment="https_proxy=http://127.0.0.1:3128"
 ExecStart=${LITELLM_BIN} --config /home/openclaw/litellm-config.yaml --port 4000 --host 127.0.0.1
