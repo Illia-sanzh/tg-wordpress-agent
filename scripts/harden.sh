@@ -602,10 +602,12 @@ if [[ "$LITELLM_CONFIGURED" != "true" ]]; then
         # typing_extensions, so global pip installs fail. A venv is the correct fix:
         # it is fully isolated from system packages, no conflicts possible.
         if ! command -v python3 &>/dev/null; then
-            spin "Installing python3" apt-get install -y -qq python3 python3-venv
-        elif ! python3 -m venv --help > /dev/null 2>&1; then
-            spin "Installing python3-venv" apt-get install -y -qq python3-venv
+            spin "Installing python3" apt-get install -y -qq python3
         fi
+        # Ubuntu splits venv into python3.X-venv packages that include ensurepip.
+        # python3-venv alone is not sufficient — the version-specific package is required.
+        PY_VER=$(python3 -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")
+        spin "Installing python${PY_VER}-venv" apt-get install -y -qq "python${PY_VER}-venv"
 
         LITELLM_VENV="${OCLAW_HOME}/litellm-venv"
         spin "Creating LiteLLM virtualenv" python3 -m venv "$LITELLM_VENV"
