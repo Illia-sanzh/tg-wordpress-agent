@@ -5,9 +5,8 @@
 # Applies production-grade security to your OpenClaw + WordPress VPS:
 #   1. SSH hardening (disable password auth)
 #   2. Tailscale VPN (private network for SSH + wp-admin)
-#   3. LiteLLM API proxy (budget limits for AI spending)
-#   4. Squid egress proxy (restrict outbound connections)
-#   5. wp-admin lockdown (only accessible via Tailscale)
+#   3. Squid egress proxy (restrict outbound connections)
+#   4. wp-admin lockdown (only accessible via Tailscale)
 #
 # Run after install.sh:
 #   bash /opt/tg-wordpress-agent/scripts/harden.sh
@@ -30,7 +29,7 @@ err()  { echo -e "${RED}[x]${NC} $1"; exit 1; }
 info() { echo -e "${CYAN}[i]${NC} $1"; }
 
 # ── Progress bar system ──
-TOTAL_STEPS=6
+TOTAL_STEPS=7
 _BAR_DRAWN=false
 HARDEN_LOG="/tmp/openclaw-harden.log"
 : > "$HARDEN_LOG"
@@ -134,8 +133,6 @@ if [[ -f "${OCLAW_HOME}/.env" ]]; then
 fi
 
 # ── Configuration ──
-LITELLM_PORT=4000
-LITELLM_BUDGET="${LITELLM_MONTHLY_BUDGET:-30}"
 SQUID_PORT=3128
 
 clear 2>/dev/null || true
@@ -147,9 +144,10 @@ echo ""
 echo "  This script will:"
 echo "    1. Disable SSH password login (key-only access)"
 echo "    2. Install Tailscale VPN for private access"
-echo "    3. Set up LiteLLM API proxy with spending limits"
-echo "    4. Set up Squid egress filtering"
-echo "    5. Lock down wp-admin to Tailscale only"
+echo "    3. Set up Squid egress filtering"
+echo "    4. Lock down wp-admin to Tailscale only"
+echo "    5. Harden the OpenClaw systemd service (process isolation)"
+echo "    6. Install LiteLLM API budget proxy (monthly spend limit)"
 echo ""
 
 # ── Pre-flight: check SSH key exists ──
@@ -174,28 +172,6 @@ if [[ "$SSH_KEY_FOUND" != "true" ]]; then
         echo "Aborted. Add your SSH key first, then re-run."
         exit 0
     fi
-fi
-
-# ── Ask for budget ──
-echo ""
-echo -e "${BOLD}  API Budget${NC}"
-echo "  Set a monthly spending limit for AI API calls."
-echo -ne "${CYAN}  Monthly budget in USD${NC} [${LITELLM_BUDGET}]: "
-read -r BUDGET_INPUT
-LITELLM_BUDGET="${BUDGET_INPUT:-$LITELLM_BUDGET}"
-echo ""
-
-# ── Read Anthropic key from .env (only needed if LiteLLM not already installed) ──
-ANTHROPIC_API_KEY=""
-if [[ -f "${OCLAW_HOME}/.env" ]]; then
-    ANTHROPIC_API_KEY=$(grep '^ANTHROPIC_API_KEY=' "${OCLAW_HOME}/.env" 2>/dev/null | cut -d= -f2 || echo "")
-fi
-
-# If LiteLLM is not yet installed and we don't have a key, ask for one
-if ! systemctl is-active litellm > /dev/null 2>&1 && [[ -z "$ANTHROPIC_API_KEY" || "$ANTHROPIC_API_KEY" == sk-litellm-* ]]; then
-    echo -ne "${CYAN}  Anthropic API key (for LiteLLM proxy)${NC}: "
-    read -rs ANTHROPIC_API_KEY
-    echo ""
 fi
 
 echo ""
@@ -283,113 +259,9 @@ else
 fi
 
 # ═════════════════════════════════════════════
-# Step 3: LiteLLM API Proxy with Budget
+# Step 3: Squid Egress Filtering
 # ═════════════════════════════════════════════
-progress 3 "Setting up LiteLLM API proxy..."
-
-LITELLM_DIR="/opt/litellm"
-
-if systemctl is-active litellm > /dev/null 2>&1 && [[ -f "${LITELLM_DIR}/config.yaml" ]]; then
-    # LiteLLM already set up by install.sh — just update budget if changed
-    action "${GREEN}✓${NC} LiteLLM already running (installed by install.sh)"
-
-    if [[ -n "$LITELLM_BUDGET" ]]; then
-        sed -i "s|max_budget:.*|max_budget: ${LITELLM_BUDGET}|" "${LITELLM_DIR}/config.yaml"
-        spin "Updating LiteLLM budget to \$${LITELLM_BUDGET}/month" systemctl restart litellm
-    fi
-
-    # Read existing master key from config
-    LITELLM_MASTER_KEY=$(grep 'master_key:' "${LITELLM_DIR}/config.yaml" 2>/dev/null | awk '{print $2}' | tr -d '"' || echo "")
-else
-    # Fresh LiteLLM install (for upgrades from older installs without LiteLLM in install.sh)
-    spin "Installing Python venv" apt-get install -y -qq python3-pip python3-venv
-
-    mkdir -p "$LITELLM_DIR"
-
-    if [[ ! -d "${LITELLM_DIR}/venv" ]]; then
-        spin "Creating LiteLLM virtualenv" python3 -m venv "${LITELLM_DIR}/venv"
-    fi
-
-    spin "Installing LiteLLM" bash -c "${LITELLM_DIR}/venv/bin/pip install --quiet --upgrade 'litellm[proxy]'"
-
-    LITELLM_MASTER_KEY="sk-litellm-$(openssl rand -hex 16)"
-
-    cat > "${LITELLM_DIR}/config.yaml" <<LITECFG
-model_list:
-  - model_name: "anthropic/claude-sonnet-4-5-20250929"
-    litellm_params:
-      model: "anthropic/claude-sonnet-4-5-20250929"
-      api_key: "${ANTHROPIC_API_KEY}"
-  - model_name: "anthropic/claude-opus-4-6"
-    litellm_params:
-      model: "anthropic/claude-opus-4-6"
-      api_key: "${ANTHROPIC_API_KEY}"
-  - model_name: "anthropic/claude-haiku-4-5-20251001"
-    litellm_params:
-      model: "anthropic/claude-haiku-4-5-20251001"
-      api_key: "${ANTHROPIC_API_KEY}"
-
-general_settings:
-  master_key: "${LITELLM_MASTER_KEY}"
-
-litellm_settings:
-  max_budget: ${LITELLM_BUDGET}
-  budget_duration: "monthly"
-  drop_params: true
-LITECFG
-
-    chmod 600 "${LITELLM_DIR}/config.yaml"
-
-    cat > /etc/systemd/system/litellm.service <<LITESVC
-[Unit]
-Description=LiteLLM API Proxy
-After=network.target
-
-[Service]
-Type=simple
-WorkingDirectory=${LITELLM_DIR}
-ExecStart=${LITELLM_DIR}/venv/bin/litellm --config ${LITELLM_DIR}/config.yaml --port ${LITELLM_PORT} --host 127.0.0.1
-Restart=on-failure
-RestartSec=10
-StandardOutput=journal
-StandardError=journal
-
-[Install]
-WantedBy=multi-user.target
-LITESVC
-
-    quiet systemctl daemon-reload
-    quiet systemctl enable litellm
-    spin "Starting LiteLLM" systemctl restart litellm
-
-    sleep 3
-    if systemctl is-active litellm > /dev/null 2>&1; then
-        action "${GREEN}✓${NC} LiteLLM proxy running on 127.0.0.1:${LITELLM_PORT}"
-    else
-        action "${YELLOW}!${NC} LiteLLM may still be starting — check: journalctl -u litellm -f"
-    fi
-
-    # Update OpenClaw .env to use LiteLLM proxy
-    if [[ -f "${OCLAW_HOME}/.env" ]]; then
-        cp "${OCLAW_HOME}/.env" "${OCLAW_HOME}/.env.bak.$(date +%Y%m%d%H%M%S)"
-        sed -i "s|^ANTHROPIC_API_KEY=.*|ANTHROPIC_API_KEY=${LITELLM_MASTER_KEY}|" "${OCLAW_HOME}/.env"
-
-        if ! grep -q '^ANTHROPIC_BASE_URL=' "${OCLAW_HOME}/.env" 2>/dev/null; then
-            echo "ANTHROPIC_BASE_URL=http://127.0.0.1:${LITELLM_PORT}" >> "${OCLAW_HOME}/.env"
-        else
-            sed -i "s|^ANTHROPIC_BASE_URL=.*|ANTHROPIC_BASE_URL=http://127.0.0.1:${LITELLM_PORT}|" "${OCLAW_HOME}/.env"
-        fi
-
-        chown openclaw:openclaw "${OCLAW_HOME}/.env"
-    fi
-
-    action "${GREEN}✓${NC} OpenClaw routed through LiteLLM (budget: \$${LITELLM_BUDGET}/month)"
-fi
-
-# ═════════════════════════════════════════════
-# Step 4: Squid Egress Filtering
-# ═════════════════════════════════════════════
-progress 4 "Setting up Squid egress proxy..."
+progress 3 "Setting up Squid egress proxy..."
 
 spin "Installing Squid" apt-get install -y -qq squid
 
@@ -485,9 +357,9 @@ fi
 action "${GREEN}✓${NC} Squid egress proxy running — outbound traffic filtered"
 
 # ═════════════════════════════════════════════
-# Step 5: wp-admin Lockdown
+# Step 4: wp-admin Lockdown
 # ═════════════════════════════════════════════
-progress 5 "Locking down wp-admin..."
+progress 4 "Locking down wp-admin..."
 
 if command -v nginx &>/dev/null && systemctl is-active nginx > /dev/null 2>&1; then
     NGINX_SNIPPET="/etc/nginx/snippets/wp-admin-restrict.conf"
@@ -579,9 +451,293 @@ else
 fi
 
 # ═════════════════════════════════════════════
-# Step 6: Restart OpenClaw
+# Step 5: Systemd Service Hardening
 # ═════════════════════════════════════════════
-progress 6 "Restarting OpenClaw with hardened config..."
+progress 5 "Hardening OpenClaw systemd service..."
+
+# Use a drop-in file so this is additive and idempotent.
+# Equivalent to Podman container-level isolation: no new privileges,
+# read-only system paths, private /tmp, and resource limits.
+DROPIN_DIR="/etc/systemd/system/openclaw.service.d"
+DROPIN_FILE="${DROPIN_DIR}/hardening.conf"
+
+quiet mkdir -p "$DROPIN_DIR"
+
+action "Writing systemd security drop-in..."
+cat > "$DROPIN_FILE" <<'DROPIN'
+# OpenClaw process isolation — applied by harden.sh
+# Equivalent to rootless Podman container security boundaries.
+
+[Service]
+# ── Privilege escalation prevention (container --no-new-privileges) ──
+# Prevent the process from gaining new privileges via setuid/setgid
+NoNewPrivileges=yes
+
+# ── Filesystem hardening (container read-only system image) ──
+# Make /usr, /boot, /etc read-only for this service
+ProtectSystem=strict
+
+# Protect /home (other users), /root, /run/user from the service
+ProtectHome=yes
+
+# Give the service its own private /tmp mount
+# Prevents temp-file leaks between processes
+PrivateTmp=yes
+
+# Prevent access to physical device nodes
+PrivateDevices=yes
+
+# Explicitly allow writes where the service legitimately needs them.
+# ReadOnlyPaths below will pin specific files read-only even inside these dirs.
+ReadWritePaths=/home/openclaw /tmp /run
+
+# ── Image immutability (container read-only image layers) ──
+# The openclaw binary itself is immutable via ProtectSystem=strict (/usr/local).
+# Additionally lock the credential and config files so a rogue agent cannot
+# exfiltrate secrets by modifying them or swap in a malicious config at runtime.
+ReadOnlyPaths=/home/openclaw/.env /home/openclaw/.openclaw/openclaw.json
+
+# ── PID namespace isolation (container --pid=private) ──
+# Give the service its own PID namespace. The process cannot see or signal
+# host processes — equivalent to Podman's default PID isolation.
+# Requires systemd 254+ (Ubuntu 24.04 ships systemd 255).
+PrivatePIDs=yes
+
+# ── Resource limits ──
+MemoryMax=768M
+CPUQuota=70%
+LimitNOFILE=65536
+
+# ── Network isolation (container private network namespace) ──
+# Force ALL outbound connections through Squid (127.0.0.1:3128).
+# The process cannot reach the internet directly even if it ignores http_proxy env vars.
+#
+# How it works:
+#   - IPAddressDeny=any  → block all outbound by default
+#   - IPAddressAllow=localhost → allow only loopback (where Squid + LiteLLM listen)
+#   - Squid/LiteLLM run as separate services so THEY are not blocked
+#   - openclaw listens on 127.0.0.1:18789 → local connections still work
+IPAddressDeny=any
+IPAddressAllow=localhost
+
+# ── Capability bounding (container --cap-drop=all) ──
+# Drop every Linux capability. Combined with NoNewPrivileges=yes, the process
+# cannot gain any elevated kernel privileges even if it tries.
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+# ── Syscall filtering (Podman default seccomp profile equivalent) ──
+# Whitelist only the syscalls a normal service needs. Blocks dangerous calls like
+# ptrace (process injection), mount, kexec, perf_event_open, kernel module loading.
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+SystemCallArchitectures=native
+
+# ── Kernel hardening (container kernel namespace isolation) ──
+# Prevent writing to kernel tunables (/proc/sys, /sys)
+ProtectKernelTunables=yes
+
+# Prevent loading/unloading kernel modules
+ProtectKernelModules=yes
+
+# Prevent reading kernel log buffer (dmesg)
+ProtectKernelLogs=yes
+
+# Make /sys/fs/cgroup read-only (prevent cgroup escapes)
+ProtectControlGroups=yes
+
+# Prevent changing the system clock
+ProtectClock=yes
+
+# Prevent changing the hostname or domainname
+ProtectHostname=yes
+
+# Prevent creating any new namespaces (mount, user, pid, net, ipc, etc.)
+# This blocks a compromised process from escaping its sandbox via unshare(2).
+RestrictNamespaces=yes
+
+# Prevent changing binary execution domain (personality syscall)
+LockPersonality=yes
+
+# Prevent setting real-time scheduling priorities
+RestrictRealtime=yes
+
+# Prevent setting SUID/SGID bits on new files
+RestrictSUIDSGID=yes
+
+# Remove all IPC objects (message queues, semaphores, shared memory)
+# owned by this service when it stops — no persistent inter-process state leaks
+RemoveIPC=yes
+DROPIN
+
+quiet systemctl daemon-reload
+action "${GREEN}✓${NC} Systemd hardening applied (NoNewPrivileges, PrivatePIDs, ProtectSystem=strict, IPAddressDeny, MemoryMax=768M, ReadOnlyPaths for credentials)"
+
+# ═════════════════════════════════════════════
+# Step 6: LiteLLM Budget Proxy
+# ═════════════════════════════════════════════
+progress 6 "Installing LiteLLM API budget proxy..."
+
+LITELLM_CFG_FILE="${OCLAW_HOME}/litellm-config.yaml"
+LITELLM_ENV_FILE="${OCLAW_HOME}/litellm.env"
+LITELLM_CONFIGURED=false
+
+# Idempotency: if ANTHROPIC_BASE_URL is already set, LiteLLM was configured on a prior run
+if grep -q '^ANTHROPIC_BASE_URL=' "${OCLAW_HOME}/.env" 2>/dev/null; then
+    LITELLM_CONFIGURED=true
+    LITELLM_STATUS="$(systemctl is-active litellm 2>/dev/null || echo 'unknown')"
+    action "${GREEN}✓${NC} LiteLLM already configured (status: ${LITELLM_STATUS}) — skipping"
+fi
+
+if [[ "$LITELLM_CONFIGURED" != "true" ]]; then
+    # Read real Anthropic API key from openclaw's env before we swap it out
+    REAL_API_KEY=$(grep '^ANTHROPIC_API_KEY=' "${OCLAW_HOME}/.env" 2>/dev/null | cut -d= -f2- || echo "")
+
+    if [[ -z "$REAL_API_KEY" ]]; then
+        warn "ANTHROPIC_API_KEY not found in ${OCLAW_HOME}/.env — skipping LiteLLM setup"
+        warn "Set ANTHROPIC_API_KEY and re-run harden.sh to enable API budget limits"
+    else
+        # Ensure pip3 is available (not installed by default on Ubuntu 24.04 minimal)
+        if ! command -v pip3 &>/dev/null; then
+            spin "Installing pip3" apt-get install -y -qq python3-pip
+        fi
+
+        # --break-system-packages is required on Ubuntu 24.04+ which uses PEP 668
+        # (prevents accidental overwrites of distro packages; safe here since we're root)
+        spin "Installing LiteLLM" pip3 install -q --break-system-packages 'litellm[proxy]'
+        LITELLM_BIN="$(which litellm 2>/dev/null || python3 -c "import sys; print(sys.prefix+'/bin/litellm')" 2>/dev/null || echo '/usr/local/bin/litellm')"
+
+        # Generate proxy master key — this replaces the real API key in openclaw's env.
+        # OpenClaw sends this key to LiteLLM; LiteLLM validates it, tracks spend, and
+        # forwards to Anthropic with the real key. OpenClaw never sees the real key again.
+        LITELLM_PROXY_KEY="sk-openclaw-$(openssl rand -hex 20)"
+
+        action "Writing LiteLLM config..."
+        cat > "$LITELLM_CFG_FILE" <<LITELLM_CFG
+# LiteLLM API Budget Proxy — configured by harden.sh
+# Intercepts OpenClaw → Anthropic traffic, enforces monthly spend limits,
+# and shields the real Anthropic API key.
+
+model_list:
+  - model_name: claude-sonnet-4-6
+    litellm_params:
+      model: anthropic/claude-sonnet-4-6
+      api_key: os.environ/REAL_ANTHROPIC_API_KEY
+  - model_name: claude-haiku-4-5-20251001
+    litellm_params:
+      model: anthropic/claude-haiku-4-5-20251001
+      api_key: os.environ/REAL_ANTHROPIC_API_KEY
+
+litellm_settings:
+  drop_params: true
+  request_timeout: 600
+
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY
+  # Hard monthly spend cap — raise or lower this to match your budget
+  max_budget: 30
+  budget_duration: 30d
+LITELLM_CFG
+        chown openclaw:openclaw "$LITELLM_CFG_FILE"
+        chmod 640 "$LITELLM_CFG_FILE"
+
+        # LiteLLM env file — root-owned (600) so the openclaw user cannot cat it directly.
+        # systemd reads EnvironmentFile as root before dropping to the service user,
+        # so LiteLLM still gets these vars at startup.
+        action "Writing LiteLLM secrets file (root-only)..."
+        cat > "$LITELLM_ENV_FILE" <<LITELLM_ENV
+# Real Anthropic API key — used by LiteLLM to forward requests to Anthropic
+# OpenClaw uses a proxy key (below) and never sees this value via the filesystem
+REAL_ANTHROPIC_API_KEY=${REAL_API_KEY}
+LITELLM_MASTER_KEY=${LITELLM_PROXY_KEY}
+LITELLM_ENV
+        chmod 600 "$LITELLM_ENV_FILE"
+        chown root:root "$LITELLM_ENV_FILE"
+
+        action "Creating LiteLLM systemd service..."
+        cat > /etc/systemd/system/litellm.service <<LITELLM_SVC
+[Unit]
+Description=LiteLLM API Budget Proxy
+Documentation=https://docs.litellm.ai
+After=network.target squid.service
+Before=openclaw.service
+
+[Service]
+Type=simple
+User=openclaw
+Group=openclaw
+WorkingDirectory=/home/openclaw
+EnvironmentFile=/home/openclaw/litellm.env
+Environment="PATH=/usr/local/bin:/usr/bin:/bin"
+Environment="http_proxy=http://127.0.0.1:3128"
+Environment="https_proxy=http://127.0.0.1:3128"
+ExecStart=${LITELLM_BIN} --config /home/openclaw/litellm-config.yaml --port 4000 --host 127.0.0.1
+Restart=on-failure
+RestartSec=15
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+LITELLM_SVC
+
+        # Tell openclaw's systemd unit to start after litellm
+        cat > "${DROPIN_DIR}/litellm-dep.conf" <<'DEPCFG'
+[Unit]
+# Ensure LiteLLM budget proxy is running before OpenClaw starts.
+# If LiteLLM dies, OpenClaw will restart and wait for it to come back.
+Wants=litellm.service
+After=litellm.service
+DEPCFG
+
+        # Swap the real API key for the proxy key in openclaw's env.
+        # Add ANTHROPIC_BASE_URL so the Anthropic SDK routes to LiteLLM instead of
+        # calling api.anthropic.com directly (which would fail — proxy key ≠ Anthropic key).
+        action "Routing OpenClaw API calls through LiteLLM..."
+        sed -i "s|^ANTHROPIC_API_KEY=.*|ANTHROPIC_API_KEY=${LITELLM_PROXY_KEY}|" "${OCLAW_HOME}/.env"
+        echo "ANTHROPIC_BASE_URL=http://127.0.0.1:4000" >> "${OCLAW_HOME}/.env"
+
+        quiet systemctl daemon-reload
+        quiet systemctl enable litellm
+        spin "Starting LiteLLM" systemctl start litellm
+
+        # Wait up to 30s for LiteLLM to pass its health check
+        LITELLM_STATUS="starting"
+        for _i in $(seq 1 10); do
+            sleep 3
+            if curl -sf "http://127.0.0.1:4000/health" > /dev/null 2>&1; then
+                LITELLM_STATUS="healthy"
+                break
+            fi
+        done
+
+        if [[ "$LITELLM_STATUS" == "healthy" ]]; then
+            LITELLM_CONFIGURED=true
+            action "${GREEN}✓${NC} LiteLLM running — \$30/month cap, real API key shielded from OpenClaw"
+        else
+            LITELLM_CONFIGURED=true  # configured but may still be starting
+            action "${YELLOW}!${NC} LiteLLM still starting — check: journalctl -u litellm -n 20"
+        fi
+
+        # Append LiteLLM details to credentials file
+        cat >> /root/setup-credentials.txt <<LITELLM_CREDS
+
+═══ LiteLLM Budget Proxy ═══
+Service:      litellm.service (127.0.0.1:4000, loopback only)
+Config:       ${LITELLM_CFG_FILE}
+Monthly cap:  \$30 (edit general_settings.max_budget in litellm-config.yaml)
+Proxy key:    ${LITELLM_PROXY_KEY}
+Real API key: secured in ${LITELLM_ENV_FILE} (root-only, 600)
+
+Check spend:  https://console.anthropic.com/settings/usage
+LITELLM_CREDS
+    fi
+fi
+
+# ═════════════════════════════════════════════
+# Step 7: Restart OpenClaw
+# ═════════════════════════════════════════════
+progress 7 "Restarting OpenClaw with hardened config..."
 
 spin "Restarting OpenClaw" systemctl restart openclaw
 
@@ -618,12 +774,6 @@ else
 echo "    Status:            not connected (run 'tailscale up')"
 fi
 echo ""
-echo -e "  ${BOLD}API Budget (LiteLLM)${NC}"
-echo "    Monthly limit:     \$${LITELLM_BUDGET}"
-echo "    Proxy:             127.0.0.1:${LITELLM_PORT}"
-echo "    Status:            $(systemctl is-active litellm 2>/dev/null || echo 'unknown')"
-echo "    Logs:              journalctl -u litellm -f"
-echo ""
 echo -e "  ${BOLD}Egress Filtering (Squid)${NC}"
 echo "    Proxy:             127.0.0.1:${SQUID_PORT}"
 echo "    Allowlist:         /etc/squid/allowed-domains.txt"
@@ -637,6 +787,32 @@ echo "    Note:              WordPress auto-detects Tailscale IP (no redirect)"
 else
 echo "    Access:            public (lock down after Tailscale connects)"
 fi
+echo ""
+echo -e "  ${BOLD}LiteLLM Budget Proxy${NC}"
+if [[ "$LITELLM_CONFIGURED" == "true" ]]; then
+echo "    Status:            $(systemctl is-active litellm 2>/dev/null || echo 'unknown')"
+echo "    Endpoint:          127.0.0.1:4000 (loopback only)"
+echo "    Monthly cap:       \$30 (edit litellm-config.yaml to change)"
+echo "    Real API key:      ${LITELLM_ENV_FILE} (root-only)"
+else
+echo "    Status:            not configured (ANTHROPIC_API_KEY missing from .env)"
+fi
+echo ""
+echo -e "  ${BOLD}Systemd Service Hardening${NC}"
+echo "    NoNewPrivileges:   yes"
+echo "    CapabilityBoundingSet: (all dropped)"
+echo "    SystemCallFilter:  @system-service (dangerous syscalls blocked)"
+echo "    ProtectSystem:     strict (/, /usr, /etc read-only)"
+echo "    PrivateTmp:        yes (isolated /tmp namespace)"
+echo "    PrivatePIDs:       yes (own PID namespace — cannot see host processes)"
+echo "    Network isolation: IPAddressDeny=any (loopback only → Squid + LiteLLM enforced)"
+echo "    Immutability:      ReadOnlyPaths on .env + openclaw.json (credentials locked)"
+echo "    Kernel hardening:  ProtectKernelTunables/Modules/Logs, ProtectControlGroups"
+echo "                       ProtectClock, ProtectHostname, RestrictNamespaces"
+echo "                       LockPersonality, RestrictRealtime, RestrictSUIDSGID"
+echo "    MemoryMax:         768 MB"
+echo "    CPUQuota:          70%"
+echo "    Drop-in:           ${DROPIN_FILE}"
 echo ""
 echo -e "  ${BOLD}OpenClaw${NC}"
 echo "    Status:            ${OPENCLAW_STATUS}"
@@ -661,10 +837,15 @@ Applied: $(date)
 
 SSH: key-only (password disabled)
 Tailscale IP: ${TS_IP:-not connected}
-LiteLLM Master Key: ${LITELLM_MASTER_KEY:-already set by install.sh}
-LiteLLM Config: ${LITELLM_DIR}/config.yaml
-LiteLLM Budget: \$${LITELLM_BUDGET}/month
 Squid Allowlist: /etc/squid/allowed-domains.txt
+Systemd drop-in: ${DROPIN_FILE}
+  NoNewPrivileges=yes, ProtectSystem=strict, PrivateTmp=yes
+  PrivatePIDs=yes (PID namespace isolation)
+  ReadOnlyPaths: .env + openclaw.json (credential immutability)
+  ProtectKernelTunables/Modules/Logs, ProtectControlGroups
+  ProtectClock, ProtectHostname, RestrictNamespaces, LockPersonality
+  RestrictRealtime, RestrictSUIDSGID, RemoveIPC
+  MemoryMax=768M, CPUQuota=70%
 
 IMPORTANT: Connect via Tailscale from now on!
   ssh root@${TS_IP:-TAILSCALE_IP}

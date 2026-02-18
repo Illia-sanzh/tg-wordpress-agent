@@ -31,7 +31,7 @@ err()  { echo -e "${RED}[x]${NC} $1"; exit 1; }
 info() { echo -e "${CYAN}[i]${NC} $1"; }
 
 # ── Progress bar system ──
-TOTAL_STEPS=11
+TOTAL_STEPS=10
 _BAR_DRAWN=false
 INSTALL_LOG="/tmp/openclaw-install.log"
 : > "$INSTALL_LOG"
@@ -277,14 +277,6 @@ echo ""
 ask_secret "  Anthropic API key" ANTHROPIC_API_KEY
 echo ""
 
-# ── Step 3b: API Budget ──
-echo -e "${BOLD}  API Budget (LiteLLM proxy)${NC}"
-echo ""
-echo "  A local proxy limits your monthly AI spend so costs don't run away."
-echo ""
-ask "  Monthly budget in USD" "30" LITELLM_BUDGET
-echo ""
-
 # ── Step 4: WordPress detection ──
 echo -e "${BOLD}Step 4: WordPress${NC}"
 echo ""
@@ -350,7 +342,6 @@ echo "  WordPress:    $(if [[ "$EXISTING_WORDPRESS" == "true" ]]; then echo "Exi
 echo "  Bot token:    ${TELEGRAM_BOT_TOKEN:0:10}...${TELEGRAM_BOT_TOKEN: -5}"
 echo "  User ID:      ${TELEGRAM_USER_ID}"
 echo "  API key:      ${ANTHROPIC_API_KEY:0:10}..."
-echo "  AI budget:    \$${LITELLM_BUDGET}/month"
 echo "  Email:        ${WP_ADMIN_EMAIL}"
 echo ""
 
@@ -787,113 +778,12 @@ chmod 440 "$SUDOERS_FILE"
 action "${GREEN}✓${NC} OpenClaw configured"
 
 # ─────────────────────────────────────────────
-# Phase 9: LiteLLM API Proxy (budget limiting)
+# Phase 9: Environment & Service
 # ─────────────────────────────────────────────
-progress 9 "Setting up LiteLLM API proxy (budget: \$${LITELLM_BUDGET}/month)..."
+progress 9 "Starting OpenClaw service..."
 
-spin "Installing Python venv" apt-get install -y -qq python3-pip python3-venv
-
-LITELLM_DIR="/opt/litellm"
-LITELLM_PORT=4000
-mkdir -p "$LITELLM_DIR"
-
-if [[ ! -d "${LITELLM_DIR}/venv" ]]; then
-    spin "Creating LiteLLM virtualenv" python3 -m venv "${LITELLM_DIR}/venv"
-fi
-
-spin "Installing LiteLLM" bash -c "${LITELLM_DIR}/venv/bin/pip install --quiet --upgrade 'litellm[proxy]'"
-
-# Generate a proxy master key
-LITELLM_MASTER_KEY="sk-litellm-$(openssl rand -hex 16)"
-
-# Write LiteLLM config — real Anthropic key stays here, never in .env
-cat > "${LITELLM_DIR}/config.yaml" <<LITECFG
-model_list:
-  - model_name: "anthropic/claude-sonnet-4-5-20250929"
-    litellm_params:
-      model: "anthropic/claude-sonnet-4-5-20250929"
-      api_key: "${ANTHROPIC_API_KEY}"
-  - model_name: "anthropic/claude-opus-4-6"
-    litellm_params:
-      model: "anthropic/claude-opus-4-6"
-      api_key: "${ANTHROPIC_API_KEY}"
-  - model_name: "anthropic/claude-haiku-4-5-20251001"
-    litellm_params:
-      model: "anthropic/claude-haiku-4-5-20251001"
-      api_key: "${ANTHROPIC_API_KEY}"
-
-general_settings:
-  master_key: "${LITELLM_MASTER_KEY}"
-
-litellm_settings:
-  max_budget: ${LITELLM_BUDGET}
-  budget_duration: "monthly"
-  drop_params: true
-LITECFG
-chmod 600 "${LITELLM_DIR}/config.yaml"
-
-# Create systemd service for LiteLLM
-cat > /etc/systemd/system/litellm.service <<LITESVC
-[Unit]
-Description=LiteLLM API Proxy
-After=network.target
-
-[Service]
-Type=simple
-WorkingDirectory=${LITELLM_DIR}
-ExecStart=${LITELLM_DIR}/venv/bin/litellm --config ${LITELLM_DIR}/config.yaml --port ${LITELLM_PORT} --host 127.0.0.1
-Restart=on-failure
-RestartSec=10
-StandardOutput=journal
-StandardError=journal
-
-[Install]
-WantedBy=multi-user.target
-LITESVC
-
-quiet systemctl daemon-reload
-quiet systemctl enable litellm
-spin "Starting LiteLLM" systemctl restart litellm
-
-# Wait for LiteLLM to be ready and verify the master key works
-action "Verifying LiteLLM proxy..."
-LITELLM_OK=false
-for attempt in $(seq 1 15); do
-    sleep 2
-    HTTP_CODE=$(curl -s -o /dev/null -w '%{http_code}' \
-        -X POST "http://127.0.0.1:${LITELLM_PORT}/v1/messages" \
-        -H "x-api-key: ${LITELLM_MASTER_KEY}" \
-        -H "content-type: application/json" \
-        -H "anthropic-version: 2023-06-01" \
-        -d '{"model":"anthropic/claude-haiku-4-5-20251001","max_tokens":1,"messages":[{"role":"user","content":"ping"}]}' \
-        2>/dev/null) || true
-    # 200 = success, 400 = bad request (means auth passed), anything not 401/403/000 = proxy is up and key works
-    if [[ "$HTTP_CODE" =~ ^(200|400|429)$ ]] || [[ "$HTTP_CODE" -ge 200 && "$HTTP_CODE" -lt 500 && "$HTTP_CODE" -ne 401 && "$HTTP_CODE" -ne 403 ]]; then
-        LITELLM_OK=true
-        break
-    fi
-    # 401/403 means key rejected, 000 means not up yet
-    if [[ "$HTTP_CODE" == "401" || "$HTTP_CODE" == "403" ]]; then
-        echo "LiteLLM returned ${HTTP_CODE} — key may be wrong (attempt ${attempt}/15)" >> "$INSTALL_LOG"
-    fi
-done
-
-if [[ "$LITELLM_OK" == "true" ]]; then
-    action "${GREEN}✓${NC} LiteLLM proxy running on 127.0.0.1:${LITELLM_PORT} (budget: \$${LITELLM_BUDGET}/month)"
-else
-    warn "LiteLLM may still be starting. Check: journalctl -u litellm -f"
-    echo "LiteLLM health check failed after 30s. Last HTTP code: ${HTTP_CODE:-none}" >> "$INSTALL_LOG"
-fi
-
-# ─────────────────────────────────────────────
-# Phase 10: Environment & Service
-# ─────────────────────────────────────────────
-progress 10 "Starting OpenClaw service..."
-
-# .env uses LiteLLM proxy key — the real Anthropic key stays only in LiteLLM's config
 cat > /home/openclaw/.env <<ENV
-ANTHROPIC_API_KEY=${LITELLM_MASTER_KEY}
-ANTHROPIC_BASE_URL=http://127.0.0.1:${LITELLM_PORT}
+ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
 TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
 WP_SITE_URL=${WP_PROTOCOL}://${WP_DOMAIN}
 WP_APP_USER=${WP_ADMIN_USER}
@@ -913,7 +803,7 @@ fi
 cat > /etc/systemd/system/openclaw.service <<SERVICE
 [Unit]
 Description=OpenClaw AI Agent Gateway
-After=network.target mariadb.service nginx.service litellm.service
+After=network.target mariadb.service nginx.service
 
 [Service]
 Type=simple
@@ -938,10 +828,10 @@ systemctl start openclaw >> "$INSTALL_LOG" 2>&1
 action "${GREEN}✓${NC} OpenClaw service started"
 
 # ─────────────────────────────────────────────
-# Phase 11: Firewall (fresh install only)
+# Phase 10: Firewall (fresh install only)
 # ─────────────────────────────────────────────
 
-progress 11 "Configuring firewall..."
+progress 10 "Configuring firewall..."
 
 if [[ "$EXISTING_WORDPRESS" != "true" ]]; then
     quiet ufw default deny incoming
@@ -983,13 +873,6 @@ if [[ "$EXISTING_WORDPRESS" != "true" ]]; then
     echo "  Password:   ${WP_ADMIN_PASS}"
     echo ""
 fi
-
-echo -e "${BOLD}  API Budget (LiteLLM)${NC}"
-echo "  Status:     $(systemctl is-active litellm 2>/dev/null || echo 'unknown')"
-echo "  Budget:     \$${LITELLM_BUDGET}/month"
-echo "  Proxy:      127.0.0.1:${LITELLM_PORT}"
-echo "  Logs:       journalctl -u litellm -f"
-echo ""
 
 echo -e "${BOLD}  OpenClaw AI Agent${NC}"
 echo "  Status:     ${OPENCLAW_STATUS}"
@@ -1039,12 +922,6 @@ Telegram:
   Bot Token:  ${TELEGRAM_BOT_TOKEN}
   User ID:    ${TELEGRAM_USER_ID}
 
-LiteLLM:
-  Master Key: ${LITELLM_MASTER_KEY}
-  Config:     ${LITELLM_DIR}/config.yaml
-  Budget:     \$${LITELLM_BUDGET}/month
-  Proxy:      127.0.0.1:${LITELLM_PORT}
-
 OpenClaw:
   Config:     ${OCLAW_CONFIG}/openclaw.json
   Env:        /home/openclaw/.env
@@ -1071,7 +948,6 @@ echo ""
 echo "  For production use, we recommend hardening your setup:"
 echo "    - Disable SSH password login (key-only)"
 echo "    - Install Tailscale VPN (private access to SSH + wp-admin)"
-echo "    - API budget limits (prevent runaway AI costs)"
 echo "    - Egress filtering (restrict outbound connections)"
 echo ""
 echo -ne "${CYAN}  Run security hardening now?${NC} [Y/n]: "
