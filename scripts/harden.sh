@@ -478,7 +478,7 @@ NoNewPrivileges=yes
 ProtectSystem=strict
 
 # Protect /home (other users), /root, /run/user from the service
-ProtectHome=yes
+ProtectHome=read-only
 
 # Give the service its own private /tmp mount
 # Prevents temp-file leaks between processes
@@ -504,7 +504,7 @@ ReadOnlyPaths=/home/openclaw/.env /home/openclaw/.openclaw/openclaw.json
 PrivatePIDs=yes
 
 # ── Resource limits ──
-MemoryMax=768M
+MemoryMax=1500M
 CPUQuota=70%
 LimitNOFILE=65536
 
@@ -571,7 +571,7 @@ RemoveIPC=yes
 DROPIN
 
 quiet systemctl daemon-reload
-action "${GREEN}✓${NC} Systemd hardening applied (NoNewPrivileges, PrivatePIDs, ProtectSystem=strict, IPAddressDeny, MemoryMax=768M, ReadOnlyPaths for credentials)"
+action "${GREEN}✓${NC} Systemd hardening applied (NoNewPrivileges, PrivatePIDs, ProtectSystem=strict, IPAddressDeny, MemoryMax=1500M, ReadOnlyPaths for credentials)"
 
 # ═════════════════════════════════════════════
 # Step 6: LiteLLM Budget Proxy
@@ -853,7 +853,7 @@ Systemd drop-in: ${DROPIN_FILE}
   ProtectKernelTunables/Modules/Logs, ProtectControlGroups
   ProtectClock, ProtectHostname, RestrictNamespaces, LockPersonality
   RestrictRealtime, RestrictSUIDSGID, RemoveIPC
-  MemoryMax=768M, CPUQuota=70%
+  MemoryMax=1500M, CPUQuota=70%
 
 IMPORTANT: Connect via Tailscale from now on!
   ssh root@${TS_IP:-TAILSCALE_IP}
