@@ -574,226 +574,217 @@ quiet systemctl daemon-reload
 action "${GREEN}✓${NC} Systemd hardening applied (NoNewPrivileges, PrivatePIDs, ProtectSystem=strict, IPAddressDeny, MemoryMax=1500M, ReadOnlyPaths for credentials)"
 
 # ═════════════════════════════════════════════
-# Step 6: LiteLLM Budget Proxy
+# Step 6: API Key Isolation Proxy
 # ═════════════════════════════════════════════
-progress 6 "Installing LiteLLM API budget proxy..."
+progress 6 "Installing API key isolation proxy..."
 
-LITELLM_CFG_FILE="${OCLAW_HOME}/litellm-config.yaml"
-LITELLM_ENV_FILE="${OCLAW_HOME}/litellm.env"
-LITELLM_CONFIGURED=false
-LITELLM_SKIP=false
+PROXY_ENV_FILE="${OCLAW_HOME}/keyproxy.env"
+PROXY_SCRIPT="/usr/local/bin/openclaw-keyproxy"
+PROXY_CONFIGURED=false
+PROXY_SKIP=false
 
-# Detect if LiteLLM was installed on a prior run.
-# Even if already installed, we still refresh the model config below so
-# model aliases stay current without requiring a full reinstall.
-LITELLM_ALREADY_INSTALLED=false
+PROXY_ALREADY_INSTALLED=false
 if grep -q '^ANTHROPIC_BASE_URL=' "${OCLAW_HOME}/.env" 2>/dev/null; then
-    LITELLM_ALREADY_INSTALLED=true
-    action "LiteLLM already installed — refreshing model config..."
+    PROXY_ALREADY_INSTALLED=true
+    action "Key proxy already installed — refreshing script..."
 fi
 
-if [[ "$LITELLM_ALREADY_INSTALLED" == "false" ]]; then
-    # Fresh install: read real API key before we swap it out
+if [[ "$PROXY_ALREADY_INSTALLED" == "false" ]]; then
     REAL_API_KEY=$(grep '^ANTHROPIC_API_KEY=' "${OCLAW_HOME}/.env" 2>/dev/null | cut -d= -f2- || echo "")
 
     if [[ -z "$REAL_API_KEY" ]]; then
-        warn "ANTHROPIC_API_KEY not found in ${OCLAW_HOME}/.env — skipping LiteLLM setup"
-        warn "Set ANTHROPIC_API_KEY and re-run harden.sh to enable API budget limits"
-        LITELLM_SKIP=true
+        warn "ANTHROPIC_API_KEY not found in ${OCLAW_HOME}/.env — skipping key proxy setup"
+        warn "Set ANTHROPIC_API_KEY and re-run harden.sh to enable key isolation"
+        PROXY_SKIP=true
     else
-        # Install LiteLLM in a virtual environment.
-        # Ubuntu 24.04 uses PEP 668 — pip cannot uninstall apt-managed packages like
-        # typing_extensions, so global pip installs fail. A venv is the correct fix:
-        # it is fully isolated from system packages, no conflicts possible.
-        if ! command -v python3 &>/dev/null; then
-            spin "Installing python3" apt-get install -y -qq python3
-        fi
-        # Ubuntu splits venv into python3.X-venv packages that include ensurepip.
-        # python3-venv alone is not sufficient — the version-specific package is required.
-        PY_VER=$(python3 -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")
-        spin "Installing python${PY_VER}-venv" apt-get install -y -qq "python${PY_VER}-venv"
+        PROXY_KEY="sk-openclaw-$(openssl rand -hex 20)"
 
-        LITELLM_VENV="${OCLAW_HOME}/litellm-venv"
-        spin "Creating LiteLLM virtualenv" python3 -m venv "$LITELLM_VENV"
-        spin "Installing LiteLLM" "${LITELLM_VENV}/bin/pip" install -q 'litellm[proxy]'
-        chown -R openclaw:openclaw "$LITELLM_VENV"
+        action "Writing key proxy secrets file (root-only)..."
+        cat > "$PROXY_ENV_FILE" <<PROXYENV
+# Real Anthropic key — only root can read this; forwarded by keyproxy to Anthropic
+REAL_KEY=${REAL_API_KEY}
+# Proxy key — what OpenClaw sends; keyproxy validates and swaps for the real key
+PROXY_KEY=${PROXY_KEY}
+PROXYENV
+        chmod 600 "$PROXY_ENV_FILE"
+        chown root:root "$PROXY_ENV_FILE"
 
-        # Generate proxy master key — this replaces the real API key in openclaw's env.
-        # OpenClaw sends this key to LiteLLM; LiteLLM validates it, tracks spend, and
-        # forwards to Anthropic with the real key. OpenClaw never sees the real key again.
-        LITELLM_PROXY_KEY="sk-openclaw-$(openssl rand -hex 20)"
+        action "Routing OpenClaw API calls through key proxy..."
+        sed -i "s|^ANTHROPIC_API_KEY=.*|ANTHROPIC_API_KEY=${PROXY_KEY}|" "${OCLAW_HOME}/.env"
+        echo "ANTHROPIC_BASE_URL=http://127.0.0.1:4000" >> "${OCLAW_HOME}/.env"
 
-        # LiteLLM env file — root-owned (600) so the openclaw user cannot cat it directly.
-        # systemd reads EnvironmentFile as root before dropping to the service user,
-        # so LiteLLM still gets these vars at startup.
-        action "Writing LiteLLM secrets file (root-only)..."
-        cat > "$LITELLM_ENV_FILE" <<LITELLM_ENV
-# Real Anthropic API key — used by LiteLLM to forward requests to Anthropic
-# OpenClaw uses a proxy key (below) and never sees this value via the filesystem
-REAL_ANTHROPIC_API_KEY=${REAL_API_KEY}
-# Also expose as ANTHROPIC_API_KEY so LiteLLM provider-routing (anthropic/model syntax)
-# uses the real key instead of falling back to the client's proxy key → 401
-ANTHROPIC_API_KEY=${REAL_API_KEY}
-LITELLM_MASTER_KEY=${LITELLM_PROXY_KEY}
-LITELLM_ENV
-        chmod 600 "$LITELLM_ENV_FILE"
-        chown root:root "$LITELLM_ENV_FILE"
+        cat >> /root/setup-credentials.txt <<PROXYCREDS
 
-        action "Creating LiteLLM systemd service..."
-        cat > /etc/systemd/system/litellm.service <<LITELLM_SVC
+═══ API Key Isolation Proxy ═══
+Service:      openclaw-keyproxy.service (127.0.0.1:4000, loopback only)
+Script:       ${PROXY_SCRIPT}
+Proxy key:    ${PROXY_KEY}
+Real API key: secured in ${PROXY_ENV_FILE} (root-only, 600)
+
+Spend tracking: https://console.anthropic.com/settings/usage
+PROXYCREDS
+    fi
+fi
+
+if [[ "$PROXY_SKIP" == "false" ]]; then
+    # Remove LiteLLM if left over from a previous version of this script
+    if systemctl is-enabled litellm &>/dev/null 2>&1; then
+        spin "Removing old LiteLLM service" \
+            bash -c 'systemctl stop litellm 2>/dev/null; systemctl disable litellm 2>/dev/null; rm -f /etc/systemd/system/litellm.service'
+    fi
+    rm -f "${DROPIN_DIR}/litellm-dep.conf"
+    # Remove the temporary IP bypass drop-in that was added when LiteLLM was disabled for testing
+    rm -f "${DROPIN_DIR}/ip-override.conf"
+
+    action "Writing key isolation proxy script..."
+    cat > "$PROXY_SCRIPT" <<'PYEOF'
+#!/usr/bin/env python3
+"""
+openclaw-keyproxy — Anthropic API key isolation proxy
+Accepts requests with PROXY_KEY, forwards to Anthropic with REAL_KEY.
+No external dependencies — Python stdlib only.
+"""
+import http.client
+import http.server
+import os
+import ssl
+import sys
+from socketserver import ThreadingMixIn
+
+PROXY_KEY = os.environ.get('PROXY_KEY', '')
+REAL_KEY  = os.environ.get('REAL_KEY', '')
+PORT      = int(os.environ.get('PROXY_PORT', '4000'))
+
+if not PROXY_KEY or not REAL_KEY:
+    sys.exit('PROXY_KEY and REAL_KEY must be set in environment')
+
+_PASS_REQ  = {'anthropic-version', 'anthropic-beta', 'content-type', 'accept', 'user-agent'}
+_DROP_RESP = {'transfer-encoding', 'connection', 'keep-alive'}
+
+
+class ProxyHandler(http.server.BaseHTTPRequestHandler):
+
+    def do_GET(self):
+        if self.path in ('/health', '/health/liveliness'):
+            self._reply(200, b'ok', 'text/plain')
+        else:
+            self._reply(404, b'not found', 'text/plain')
+
+    def do_POST(self):
+        if self.headers.get('x-api-key', '') != PROXY_KEY:
+            body = b'{"error":{"type":"authentication_error","message":"invalid x-api-key"}}'
+            self._reply(401, body, 'application/json')
+            return
+
+        length = int(self.headers.get('Content-Length', 0))
+        req_body = self.rfile.read(length) if length > 0 else b''
+
+        fwd = {'x-api-key': REAL_KEY}
+        for h in _PASS_REQ:
+            v = self.headers.get(h)
+            if v:
+                fwd[h] = v
+        if req_body:
+            fwd['Content-Length'] = str(len(req_body))
+
+        ctx = ssl.create_default_context()
+        conn = http.client.HTTPSConnection('api.anthropic.com', context=ctx, timeout=600)
+        try:
+            conn.request('POST', self.path, body=req_body, headers=fwd)
+            resp = conn.getresponse()
+            self.send_response(resp.status)
+            for k, v in resp.getheaders():
+                if k.lower() not in _DROP_RESP:
+                    self.send_header(k, v)
+            self.end_headers()
+            while True:
+                chunk = resp.read(8192)
+                if not chunk:
+                    break
+                self.wfile.write(chunk)
+                self.wfile.flush()
+        except Exception as exc:
+            try:
+                self._reply(502, str(exc).encode(), 'text/plain')
+            except Exception:
+                pass
+        finally:
+            conn.close()
+
+    def _reply(self, code, body, ctype):
+        self.send_response(code)
+        self.send_header('Content-Type', ctype)
+        self.send_header('Content-Length', str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, fmt, *args):
+        sys.stderr.write(f'keyproxy {fmt % args}\n')
+
+
+class ThreadedServer(ThreadingMixIn, http.server.HTTPServer):
+    daemon_threads = True
+
+
+if __name__ == '__main__':
+    srv = ThreadedServer(('127.0.0.1', PORT), ProxyHandler)
+    print(f'openclaw-keyproxy listening on 127.0.0.1:{PORT}', flush=True)
+    srv.serve_forever()
+PYEOF
+    chmod 755 "$PROXY_SCRIPT"
+
+    action "Creating key proxy systemd service..."
+    cat > /etc/systemd/system/openclaw-keyproxy.service <<'PROXYSVC'
 [Unit]
-Description=LiteLLM API Budget Proxy
-Documentation=https://docs.litellm.ai
-After=network.target squid.service
+Description=OpenClaw API Key Isolation Proxy
+After=network.target
 Before=openclaw.service
 
 [Service]
 Type=simple
-User=openclaw
-Group=openclaw
-WorkingDirectory=/home/openclaw
-EnvironmentFile=/home/openclaw/litellm.env
-Environment="PATH=/home/openclaw/litellm-venv/bin:/usr/local/bin:/usr/bin:/bin"
-Environment="http_proxy=http://127.0.0.1:3128"
-Environment="https_proxy=http://127.0.0.1:3128"
-ExecStart=/home/openclaw/litellm-venv/bin/litellm --config /home/openclaw/litellm-config.yaml --port 4000 --host 127.0.0.1
+User=root
+EnvironmentFile=/home/openclaw/keyproxy.env
+ExecStart=/usr/bin/python3 /usr/local/bin/openclaw-keyproxy
 Restart=on-failure
-RestartSec=15
+RestartSec=5
 StandardOutput=journal
 StandardError=journal
 
 [Install]
 WantedBy=multi-user.target
-LITELLM_SVC
+PROXYSVC
 
-        # Tell openclaw's systemd unit to start after litellm
-        cat > "${DROPIN_DIR}/litellm-dep.conf" <<'DEPCFG'
+    cat > "${DROPIN_DIR}/keyproxy-dep.conf" <<'DEPCFG'
 [Unit]
-# Ensure LiteLLM budget proxy is running before OpenClaw starts.
-# If LiteLLM dies, OpenClaw will restart and wait for it to come back.
-Wants=litellm.service
-After=litellm.service
+Wants=openclaw-keyproxy.service
+After=openclaw-keyproxy.service
 DEPCFG
 
-        # Swap the real API key for the proxy key in openclaw's env.
-        # Add ANTHROPIC_BASE_URL so the Anthropic SDK routes to LiteLLM instead of
-        # calling api.anthropic.com directly (which would fail — proxy key ≠ Anthropic key).
-        action "Routing OpenClaw API calls through LiteLLM..."
-        sed -i "s|^ANTHROPIC_API_KEY=.*|ANTHROPIC_API_KEY=${LITELLM_PROXY_KEY}|" "${OCLAW_HOME}/.env"
-        echo "ANTHROPIC_BASE_URL=http://127.0.0.1:4000" >> "${OCLAW_HOME}/.env"
+    quiet systemctl daemon-reload
+    quiet systemctl enable openclaw-keyproxy
 
-        quiet systemctl daemon-reload
-        quiet systemctl enable litellm
-
-        # Append LiteLLM details to credentials file
-        cat >> /root/setup-credentials.txt <<LITELLM_CREDS
-
-═══ LiteLLM Budget Proxy ═══
-Service:      litellm.service (127.0.0.1:4000, loopback only)
-Config:       ${LITELLM_CFG_FILE}
-Monthly cap:  \$30 (edit general_settings.max_budget in litellm-config.yaml)
-Proxy key:    ${LITELLM_PROXY_KEY}
-Real API key: secured in ${LITELLM_ENV_FILE} (root-only, 600)
-
-Check spend:  https://console.anthropic.com/settings/usage
-LITELLM_CREDS
-    fi  # end: api key present
-fi  # end: fresh install block
-
-if [[ "$LITELLM_SKIP" == "false" ]]; then
-    # Always write the latest model config — even on re-runs, so model aliases
-    # are kept current without requiring a full reinstall.
-    # Root cause of "invalid x-api-key": openclaw.json uses "anthropic/claude-sonnet-4-5-20250929"
-    # but litellm-config.yaml didn't have that model, causing LiteLLM to proxy it directly to
-    # Anthropic with the proxy key (which is not a valid Anthropic key) → 401.
-    action "Writing LiteLLM model config..."
-    cat > "$LITELLM_CFG_FILE" <<LITELLM_CFG
-model_list:
-  - model_name: claude-sonnet-4-6
-    litellm_params:
-      model: anthropic/claude-sonnet-4-6
-      api_key: os.environ/REAL_ANTHROPIC_API_KEY
-  - model_name: anthropic/claude-sonnet-4-6
-    litellm_params:
-      model: anthropic/claude-sonnet-4-6
-      api_key: os.environ/REAL_ANTHROPIC_API_KEY
-  - model_name: claude-sonnet-4-5-20250929
-    litellm_params:
-      model: anthropic/claude-sonnet-4-6
-      api_key: os.environ/REAL_ANTHROPIC_API_KEY
-  - model_name: anthropic/claude-sonnet-4-5-20250929
-    litellm_params:
-      model: anthropic/claude-sonnet-4-6
-      api_key: os.environ/REAL_ANTHROPIC_API_KEY
-  - model_name: claude-haiku-4-5-20251001
-    litellm_params:
-      model: anthropic/claude-haiku-4-5-20251001
-      api_key: os.environ/REAL_ANTHROPIC_API_KEY
-  - model_name: anthropic/claude-haiku-4-5-20251001
-    litellm_params:
-      model: anthropic/claude-haiku-4-5-20251001
-      api_key: os.environ/REAL_ANTHROPIC_API_KEY
-litellm_settings:
-  drop_params: true
-  request_timeout: 600
-general_settings:
-  master_key: os.environ/LITELLM_MASTER_KEY
-  max_budget: 30
-  budget_duration: 30d
-LITELLM_CFG
-    chown openclaw:openclaw "$LITELLM_CFG_FILE"
-    chmod 640 "$LITELLM_CFG_FILE"
-
-    # Ensure ANTHROPIC_API_KEY is in litellm.env.
-    # LiteLLM uses provider-based routing when the model name starts with "anthropic/",
-    # which reads ANTHROPIC_API_KEY (not REAL_ANTHROPIC_API_KEY) from the environment.
-    # Without this, model requests like "anthropic/claude-sonnet-4-5-20250929" fall back
-    # to the client's proxy key and Anthropic returns 401.
-    if [[ -f "$LITELLM_ENV_FILE" ]] && ! grep -q '^ANTHROPIC_API_KEY=' "$LITELLM_ENV_FILE" 2>/dev/null; then
-        REAL_KEY_VAL=$(grep '^REAL_ANTHROPIC_API_KEY=' "$LITELLM_ENV_FILE" | cut -d= -f2-)
-        if [[ -n "$REAL_KEY_VAL" ]]; then
-            printf '\n# LiteLLM provider routing fallback\nANTHROPIC_API_KEY=%s\n' "$REAL_KEY_VAL" >> "$LITELLM_ENV_FILE"
-            action "Added ANTHROPIC_API_KEY to litellm.env for provider routing"
-        fi
-    fi
-
-    # Ensure openclaw.json uses the canonical model name without anthropic/ prefix.
-    # The anthropic/ prefix triggers LiteLLM provider routing (which uses ANTHROPIC_API_KEY).
-    # A name without the prefix triggers model_list lookup (which uses the configured api_key).
-    # Using the canonical name is simpler and avoids routing ambiguity.
-    OCLAW_JSON="${OCLAW_HOME}/.openclaw/openclaw.json"
-    if [[ -f "$OCLAW_JSON" ]] && grep -q '"model":.*"anthropic/' "$OCLAW_JSON" 2>/dev/null; then
-        OLD_MODEL=$(grep -o '"model": *"[^"]*"' "$OCLAW_JSON" | head -1 | sed 's/"model": *"\([^"]*\)"/\1/')
-        sed -i 's|"model": *"anthropic/[^"]*"|"model": "claude-sonnet-4-6"|g' "$OCLAW_JSON"
-        chown openclaw:openclaw "$OCLAW_JSON"
-        action "Updated openclaw.json model: ${OLD_MODEL} → claude-sonnet-4-6"
-    fi
-
-    # Start (fresh install) or restart (re-run, to pick up model config changes)
-    if [[ "$LITELLM_ALREADY_INSTALLED" == "true" ]]; then
-        spin "Reloading LiteLLM config" systemctl restart litellm
+    if [[ "$PROXY_ALREADY_INSTALLED" == "true" ]]; then
+        spin "Restarting key proxy" systemctl restart openclaw-keyproxy
     else
-        spin "Starting LiteLLM" systemctl start litellm
+        spin "Starting key proxy" systemctl start openclaw-keyproxy
     fi
 
-    # Wait up to 30s for LiteLLM to become ready.
-    # Use /health/liveliness — a simple ping that doesn't require an API key.
-    LITELLM_STATUS="starting"
-    for _i in $(seq 1 10); do
-        sleep 3
-        if curl -sf "http://127.0.0.1:4000/health/liveliness" > /dev/null 2>&1; then
-            LITELLM_STATUS="healthy"
+    PROXY_STATUS="starting"
+    for _i in $(seq 1 5); do
+        sleep 2
+        if curl -sf "http://127.0.0.1:4000/health" > /dev/null 2>&1; then
+            PROXY_STATUS="healthy"
             break
         fi
     done
 
-    LITELLM_CONFIGURED=true
-    if [[ "$LITELLM_STATUS" == "healthy" ]]; then
-        action "${GREEN}✓${NC} LiteLLM running — \$30/month cap, real API key shielded from OpenClaw"
+    PROXY_CONFIGURED=true
+    if [[ "$PROXY_STATUS" == "healthy" ]]; then
+        action "${GREEN}✓${NC} Key proxy running — real API key isolated from OpenClaw"
     else
-        action "${YELLOW}!${NC} LiteLLM still starting — check: journalctl -u litellm -n 20"
+        action "${YELLOW}!${NC} Key proxy still starting — check: journalctl -u openclaw-keyproxy -n 20"
     fi
-fi  # end: LITELLM_SKIP check
+fi  # end: PROXY_SKIP check
 
 # ═════════════════════════════════════════════
 # Step 7: Restart OpenClaw
@@ -849,12 +840,12 @@ else
 echo "    Access:            public (lock down after Tailscale connects)"
 fi
 echo ""
-echo -e "  ${BOLD}LiteLLM Budget Proxy${NC}"
-if [[ "$LITELLM_CONFIGURED" == "true" ]]; then
-echo "    Status:            $(systemctl is-active litellm 2>/dev/null || echo 'unknown')"
+echo -e "  ${BOLD}Key Isolation Proxy${NC}"
+if [[ "$PROXY_CONFIGURED" == "true" ]]; then
+echo "    Status:            $(systemctl is-active openclaw-keyproxy 2>/dev/null || echo 'unknown')"
 echo "    Endpoint:          127.0.0.1:4000 (loopback only)"
-echo "    Monthly cap:       \$30 (edit litellm-config.yaml to change)"
-echo "    Real API key:      ${LITELLM_ENV_FILE} (root-only)"
+echo "    Real API key:      ${PROXY_ENV_FILE} (root-only)"
+echo "    Spend tracking:    https://console.anthropic.com/settings/usage"
 else
 echo "    Status:            not configured (ANTHROPIC_API_KEY missing from .env)"
 fi
@@ -866,7 +857,7 @@ echo "    SystemCallFilter:  @system-service (dangerous syscalls blocked)"
 echo "    ProtectSystem:     strict (/, /usr, /etc read-only)"
 echo "    PrivateTmp:        yes (isolated /tmp namespace)"
 echo "    PrivatePIDs:       yes (own PID namespace — cannot see host processes)"
-echo "    Network isolation: IPAddressDeny=any (loopback only → Squid + LiteLLM enforced)"
+echo "    Network isolation: IPAddressDeny=any (loopback only → Squid + key proxy enforced)"
 echo "    Immutability:      ReadOnlyPaths on .env + openclaw.json (credentials locked)"
 echo "    Kernel hardening:  ProtectKernelTunables/Modules/Logs, ProtectControlGroups"
 echo "                       ProtectClock, ProtectHostname, RestrictNamespaces"
