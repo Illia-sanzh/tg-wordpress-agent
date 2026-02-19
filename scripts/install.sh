@@ -708,7 +708,7 @@ cat > "${OCLAW_CONFIG}/openclaw.json" <<OCJSON
     "agents": {
         "defaults": {
             "model": {
-                "primary": "anthropic/claude-sonnet-4-5-20250929"
+                "primary": "claude-sonnet-4-6"
             }
         }
     },

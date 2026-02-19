@@ -581,21 +581,25 @@ progress 6 "Installing LiteLLM API budget proxy..."
 LITELLM_CFG_FILE="${OCLAW_HOME}/litellm-config.yaml"
 LITELLM_ENV_FILE="${OCLAW_HOME}/litellm.env"
 LITELLM_CONFIGURED=false
+LITELLM_SKIP=false
 
-# Idempotency: if ANTHROPIC_BASE_URL is already set, LiteLLM was configured on a prior run
+# Detect if LiteLLM was installed on a prior run.
+# Even if already installed, we still refresh the model config below so
+# model aliases stay current without requiring a full reinstall.
+LITELLM_ALREADY_INSTALLED=false
 if grep -q '^ANTHROPIC_BASE_URL=' "${OCLAW_HOME}/.env" 2>/dev/null; then
-    LITELLM_CONFIGURED=true
-    LITELLM_STATUS="$(systemctl is-active litellm 2>/dev/null || echo 'unknown')"
-    action "${GREEN}✓${NC} LiteLLM already configured (status: ${LITELLM_STATUS}) — skipping"
+    LITELLM_ALREADY_INSTALLED=true
+    action "LiteLLM already installed — refreshing model config..."
 fi
 
-if [[ "$LITELLM_CONFIGURED" != "true" ]]; then
-    # Read real Anthropic API key from openclaw's env before we swap it out
+if [[ "$LITELLM_ALREADY_INSTALLED" == "false" ]]; then
+    # Fresh install: read real API key before we swap it out
     REAL_API_KEY=$(grep '^ANTHROPIC_API_KEY=' "${OCLAW_HOME}/.env" 2>/dev/null | cut -d= -f2- || echo "")
 
     if [[ -z "$REAL_API_KEY" ]]; then
         warn "ANTHROPIC_API_KEY not found in ${OCLAW_HOME}/.env — skipping LiteLLM setup"
         warn "Set ANTHROPIC_API_KEY and re-run harden.sh to enable API budget limits"
+        LITELLM_SKIP=true
     else
         # Install LiteLLM in a virtual environment.
         # Ubuntu 24.04 uses PEP 668 — pip cannot uninstall apt-managed packages like
@@ -612,42 +616,12 @@ if [[ "$LITELLM_CONFIGURED" != "true" ]]; then
         LITELLM_VENV="${OCLAW_HOME}/litellm-venv"
         spin "Creating LiteLLM virtualenv" python3 -m venv "$LITELLM_VENV"
         spin "Installing LiteLLM" "${LITELLM_VENV}/bin/pip" install -q 'litellm[proxy]'
-        LITELLM_BIN="${LITELLM_VENV}/bin/litellm"
         chown -R openclaw:openclaw "$LITELLM_VENV"
 
         # Generate proxy master key — this replaces the real API key in openclaw's env.
         # OpenClaw sends this key to LiteLLM; LiteLLM validates it, tracks spend, and
         # forwards to Anthropic with the real key. OpenClaw never sees the real key again.
         LITELLM_PROXY_KEY="sk-openclaw-$(openssl rand -hex 20)"
-
-        action "Writing LiteLLM config..."
-        cat > "$LITELLM_CFG_FILE" <<LITELLM_CFG
-# LiteLLM API Budget Proxy — configured by harden.sh
-# Intercepts OpenClaw → Anthropic traffic, enforces monthly spend limits,
-# and shields the real Anthropic API key.
-
-model_list:
-  - model_name: claude-sonnet-4-6
-    litellm_params:
-      model: anthropic/claude-sonnet-4-6
-      api_key: os.environ/REAL_ANTHROPIC_API_KEY
-  - model_name: claude-haiku-4-5-20251001
-    litellm_params:
-      model: anthropic/claude-haiku-4-5-20251001
-      api_key: os.environ/REAL_ANTHROPIC_API_KEY
-
-litellm_settings:
-  drop_params: true
-  request_timeout: 600
-
-general_settings:
-  master_key: os.environ/LITELLM_MASTER_KEY
-  # Hard monthly spend cap — raise or lower this to match your budget
-  max_budget: 30
-  budget_duration: 30d
-LITELLM_CFG
-        chown openclaw:openclaw "$LITELLM_CFG_FILE"
-        chmod 640 "$LITELLM_CFG_FILE"
 
         # LiteLLM env file — root-owned (600) so the openclaw user cannot cat it directly.
         # systemd reads EnvironmentFile as root before dropping to the service user,
@@ -676,10 +650,10 @@ User=openclaw
 Group=openclaw
 WorkingDirectory=/home/openclaw
 EnvironmentFile=/home/openclaw/litellm.env
-Environment="PATH=${OCLAW_HOME}/litellm-venv/bin:/usr/local/bin:/usr/bin:/bin"
+Environment="PATH=/home/openclaw/litellm-venv/bin:/usr/local/bin:/usr/bin:/bin"
 Environment="http_proxy=http://127.0.0.1:3128"
 Environment="https_proxy=http://127.0.0.1:3128"
-ExecStart=${LITELLM_BIN} --config /home/openclaw/litellm-config.yaml --port 4000 --host 127.0.0.1
+ExecStart=/home/openclaw/litellm-venv/bin/litellm --config /home/openclaw/litellm-config.yaml --port 4000 --host 127.0.0.1
 Restart=on-failure
 RestartSec=15
 StandardOutput=journal
@@ -707,25 +681,6 @@ DEPCFG
 
         quiet systemctl daemon-reload
         quiet systemctl enable litellm
-        spin "Starting LiteLLM" systemctl start litellm
-
-        # Wait up to 30s for LiteLLM to pass its health check
-        LITELLM_STATUS="starting"
-        for _i in $(seq 1 10); do
-            sleep 3
-            if curl -sf "http://127.0.0.1:4000/health" > /dev/null 2>&1; then
-                LITELLM_STATUS="healthy"
-                break
-            fi
-        done
-
-        if [[ "$LITELLM_STATUS" == "healthy" ]]; then
-            LITELLM_CONFIGURED=true
-            action "${GREEN}✓${NC} LiteLLM running — \$30/month cap, real API key shielded from OpenClaw"
-        else
-            LITELLM_CONFIGURED=true  # configured but may still be starting
-            action "${YELLOW}!${NC} LiteLLM still starting — check: journalctl -u litellm -n 20"
-        fi
 
         # Append LiteLLM details to credentials file
         cat >> /root/setup-credentials.txt <<LITELLM_CREDS
@@ -739,8 +694,83 @@ Real API key: secured in ${LITELLM_ENV_FILE} (root-only, 600)
 
 Check spend:  https://console.anthropic.com/settings/usage
 LITELLM_CREDS
+    fi  # end: api key present
+fi  # end: fresh install block
+
+if [[ "$LITELLM_SKIP" == "false" ]]; then
+    # Always write the latest model config — even on re-runs, so model aliases
+    # are kept current without requiring a full reinstall.
+    # Root cause of "invalid x-api-key": openclaw.json uses "anthropic/claude-sonnet-4-5-20250929"
+    # but litellm-config.yaml didn't have that model, causing LiteLLM to proxy it directly to
+    # Anthropic with the proxy key (which is not a valid Anthropic key) → 401.
+    action "Writing LiteLLM model config..."
+    cat > "$LITELLM_CFG_FILE" <<LITELLM_CFG
+# LiteLLM API Budget Proxy — configured by harden.sh
+# Intercepts OpenClaw → Anthropic traffic, enforces monthly spend limits,
+# and shields the real Anthropic API key.
+
+model_list:
+  - model_name: claude-sonnet-4-6
+    litellm_params:
+      model: anthropic/claude-sonnet-4-6
+      api_key: os.environ/REAL_ANTHROPIC_API_KEY
+  # Aliases for the older default model used in openclaw.json
+  # (both with and without the "anthropic/" provider prefix, to handle both SDK styles)
+  - model_name: claude-sonnet-4-5-20250929
+    litellm_params:
+      model: anthropic/claude-sonnet-4-6
+      api_key: os.environ/REAL_ANTHROPIC_API_KEY
+  - model_name: anthropic/claude-sonnet-4-5-20250929
+    litellm_params:
+      model: anthropic/claude-sonnet-4-6
+      api_key: os.environ/REAL_ANTHROPIC_API_KEY
+  - model_name: claude-haiku-4-5-20251001
+    litellm_params:
+      model: anthropic/claude-haiku-4-5-20251001
+      api_key: os.environ/REAL_ANTHROPIC_API_KEY
+  - model_name: anthropic/claude-haiku-4-5-20251001
+    litellm_params:
+      model: anthropic/claude-haiku-4-5-20251001
+      api_key: os.environ/REAL_ANTHROPIC_API_KEY
+
+litellm_settings:
+  drop_params: true
+  request_timeout: 600
+
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY
+  # Hard monthly spend cap — raise or lower this to match your budget
+  max_budget: 30
+  budget_duration: 30d
+LITELLM_CFG
+    chown openclaw:openclaw "$LITELLM_CFG_FILE"
+    chmod 640 "$LITELLM_CFG_FILE"
+
+    # Start (fresh install) or restart (re-run, to pick up model config changes)
+    if [[ "$LITELLM_ALREADY_INSTALLED" == "true" ]]; then
+        spin "Reloading LiteLLM config" systemctl restart litellm
+    else
+        spin "Starting LiteLLM" systemctl start litellm
     fi
-fi
+
+    # Wait up to 30s for LiteLLM to become ready.
+    # Use /health/liveliness — a simple ping that doesn't require an API key.
+    LITELLM_STATUS="starting"
+    for _i in $(seq 1 10); do
+        sleep 3
+        if curl -sf "http://127.0.0.1:4000/health/liveliness" > /dev/null 2>&1; then
+            LITELLM_STATUS="healthy"
+            break
+        fi
+    done
+
+    LITELLM_CONFIGURED=true
+    if [[ "$LITELLM_STATUS" == "healthy" ]]; then
+        action "${GREEN}✓${NC} LiteLLM running — \$30/month cap, real API key shielded from OpenClaw"
+    else
+        action "${YELLOW}!${NC} LiteLLM still starting — check: journalctl -u litellm -n 20"
+    fi
+fi  # end: LITELLM_SKIP check
 
 # ═════════════════════════════════════════════
 # Step 7: Restart OpenClaw
@@ -818,7 +848,7 @@ echo "    Immutability:      ReadOnlyPaths on .env + openclaw.json (credentials 
 echo "    Kernel hardening:  ProtectKernelTunables/Modules/Logs, ProtectControlGroups"
 echo "                       ProtectClock, ProtectHostname, RestrictNamespaces"
 echo "                       LockPersonality, RestrictRealtime, RestrictSUIDSGID"
-echo "    MemoryMax:         768 MB"
+echo "    MemoryMax:         1500 MB"
 echo "    CPUQuota:          70%"
 echo "    Drop-in:           ${DROPIN_FILE}"
 echo ""
