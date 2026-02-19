@@ -705,17 +705,11 @@ if [[ "$LITELLM_SKIP" == "false" ]]; then
     # Anthropic with the proxy key (which is not a valid Anthropic key) → 401.
     action "Writing LiteLLM model config..."
     cat > "$LITELLM_CFG_FILE" <<LITELLM_CFG
-# LiteLLM API Budget Proxy — configured by harden.sh
-# Intercepts OpenClaw → Anthropic traffic, enforces monthly spend limits,
-# and shields the real Anthropic API key.
-
 model_list:
   - model_name: claude-sonnet-4-6
     litellm_params:
       model: anthropic/claude-sonnet-4-6
       api_key: os.environ/REAL_ANTHROPIC_API_KEY
-  # Aliases for the older default model used in openclaw.json
-  # (both with and without the "anthropic/" provider prefix, to handle both SDK styles)
   - model_name: claude-sonnet-4-5-20250929
     litellm_params:
       model: anthropic/claude-sonnet-4-6
@@ -732,14 +726,11 @@ model_list:
     litellm_params:
       model: anthropic/claude-haiku-4-5-20251001
       api_key: os.environ/REAL_ANTHROPIC_API_KEY
-
 litellm_settings:
   drop_params: true
   request_timeout: 600
-
 general_settings:
   master_key: os.environ/LITELLM_MASTER_KEY
-  # Hard monthly spend cap — raise or lower this to match your budget
   max_budget: 30
   budget_duration: 30d
 LITELLM_CFG
