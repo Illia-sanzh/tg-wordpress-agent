@@ -631,6 +631,9 @@ if [[ "$LITELLM_ALREADY_INSTALLED" == "false" ]]; then
 # Real Anthropic API key — used by LiteLLM to forward requests to Anthropic
 # OpenClaw uses a proxy key (below) and never sees this value via the filesystem
 REAL_ANTHROPIC_API_KEY=${REAL_API_KEY}
+# Also expose as ANTHROPIC_API_KEY so LiteLLM provider-routing (anthropic/model syntax)
+# uses the real key instead of falling back to the client's proxy key → 401
+ANTHROPIC_API_KEY=${REAL_API_KEY}
 LITELLM_MASTER_KEY=${LITELLM_PROXY_KEY}
 LITELLM_ENV
         chmod 600 "$LITELLM_ENV_FILE"
@@ -736,6 +739,31 @@ general_settings:
 LITELLM_CFG
     chown openclaw:openclaw "$LITELLM_CFG_FILE"
     chmod 640 "$LITELLM_CFG_FILE"
+
+    # Ensure ANTHROPIC_API_KEY is in litellm.env.
+    # LiteLLM uses provider-based routing when the model name starts with "anthropic/",
+    # which reads ANTHROPIC_API_KEY (not REAL_ANTHROPIC_API_KEY) from the environment.
+    # Without this, model requests like "anthropic/claude-sonnet-4-5-20250929" fall back
+    # to the client's proxy key and Anthropic returns 401.
+    if [[ -f "$LITELLM_ENV_FILE" ]] && ! grep -q '^ANTHROPIC_API_KEY=' "$LITELLM_ENV_FILE" 2>/dev/null; then
+        REAL_KEY_VAL=$(grep '^REAL_ANTHROPIC_API_KEY=' "$LITELLM_ENV_FILE" | cut -d= -f2-)
+        if [[ -n "$REAL_KEY_VAL" ]]; then
+            printf '\n# LiteLLM provider routing fallback\nANTHROPIC_API_KEY=%s\n' "$REAL_KEY_VAL" >> "$LITELLM_ENV_FILE"
+            action "Added ANTHROPIC_API_KEY to litellm.env for provider routing"
+        fi
+    fi
+
+    # Ensure openclaw.json uses the canonical model name without anthropic/ prefix.
+    # The anthropic/ prefix triggers LiteLLM provider routing (which uses ANTHROPIC_API_KEY).
+    # A name without the prefix triggers model_list lookup (which uses the configured api_key).
+    # Using the canonical name is simpler and avoids routing ambiguity.
+    OCLAW_JSON="${OCLAW_HOME}/.openclaw/openclaw.json"
+    if [[ -f "$OCLAW_JSON" ]] && grep -q '"model":.*"anthropic/' "$OCLAW_JSON" 2>/dev/null; then
+        OLD_MODEL=$(grep -o '"model": *"[^"]*"' "$OCLAW_JSON" | head -1 | sed 's/"model": *"\([^"]*\)"/\1/')
+        sed -i 's|"model": *"anthropic/[^"]*"|"model": "claude-sonnet-4-6"|g' "$OCLAW_JSON"
+        chown openclaw:openclaw "$OCLAW_JSON"
+        action "Updated openclaw.json model: ${OLD_MODEL} → claude-sonnet-4-6"
+    fi
 
     # Start (fresh install) or restart (re-run, to pick up model config changes)
     if [[ "$LITELLM_ALREADY_INSTALLED" == "true" ]]; then
