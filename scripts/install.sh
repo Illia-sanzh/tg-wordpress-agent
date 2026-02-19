@@ -269,16 +269,12 @@ ask "  Bot token" "" TELEGRAM_BOT_TOKEN
 ask "  Your Telegram user ID" "" TELEGRAM_USER_ID
 echo ""
 
-# ── Step 3: API Key & Budget ──
-echo -e "${BOLD}Step 3: AI API key & spend limit${NC}"
+# ── Step 3: API Key ──
+echo -e "${BOLD}Step 3: AI API key${NC}"
 echo ""
 echo "  Get an API key from console.anthropic.com"
 echo ""
 ask_secret "  Anthropic API key" ANTHROPIC_API_KEY
-echo ""
-echo "  LiteLLM will hard-cap monthly API spend. AI calls stop"
-echo "  once this limit is reached until the next monthly reset."
-ask "  Monthly API budget (USD)" "30" API_BUDGET
 echo ""
 
 # ── Step 4: WordPress detection ──
@@ -346,7 +342,6 @@ echo "  WordPress:    $(if [[ "$EXISTING_WORDPRESS" == "true" ]]; then echo "Exi
 echo "  Bot token:    ${TELEGRAM_BOT_TOKEN:0:10}...${TELEGRAM_BOT_TOKEN: -5}"
 echo "  User ID:      ${TELEGRAM_USER_ID}"
 echo "  API key:      ${ANTHROPIC_API_KEY:0:10}..."
-echo "  Budget:       \$${API_BUDGET}/month"
 echo "  Email:        ${WP_ADMIN_EMAIL}"
 echo ""
 
@@ -449,26 +444,6 @@ else
 fi
 
 spin "Installing pnpm" npm install -g pnpm || true
-
-# Install Podman + podman-compose (needed for LiteLLM/Squid containers)
-if ! command -v podman &>/dev/null; then
-    spin "Installing Podman" apt-get install -y -qq podman
-else
-    action "${GREEN}✓${NC} Podman already installed ($(podman --version | awk '{print $3}'))"
-fi
-
-if ! command -v podman-compose &>/dev/null; then
-    # Try apt first (available on Ubuntu 22.04+); fall back to pipx for older setups
-    if apt-cache show podman-compose > /dev/null 2>&1; then
-        spin "Installing podman-compose" apt-get install -y -qq podman-compose
-    else
-        spin "Installing pipx + podman-compose" bash -c 'apt-get install -y -qq pipx && pipx install podman-compose && pipx ensurepath'
-        # Add pipx bin to PATH for this session so subsequent commands find it
-        export PATH="$PATH:/root/.local/bin"
-    fi
-else
-    action "${GREEN}✓${NC} podman-compose already installed"
-fi
 
 # ─────────────────────────────────────────────
 # Phase 3: MariaDB (fresh install only)
@@ -719,196 +694,6 @@ useradd -r -m -s /bin/bash openclaw 2>/dev/null || true
 # Install OpenClaw
 spin "Installing OpenClaw via npm" npm install -g openclaw@latest
 
-# Install global-agent so Node.js HTTP/HTTPS honours http_proxy env vars.
-# Pin to v2 — v3 is a TypeScript rewrite that sometimes publishes without dist/.
-spin "Installing global-agent (Node.js proxy bootstrap)" npm install -g global-agent@2
-GLOBAL_AGENT_BOOTSTRAP="$(npm root -g)/global-agent/bootstrap"
-# Sanity-check: dist/index.js must exist or the --require preload will crash Node.
-if [[ ! -f "$(npm root -g)/global-agent/dist/index.js" ]]; then
-    warn "global-agent dist/ missing after install — retrying..."
-    npm install -g global-agent@2 --force >> "$INSTALL_LOG" 2>&1 || true
-fi
-
-# ─────────────────────────────────────────────
-# Container stack: LiteLLM (API budget proxy) + Squid (egress filter)
-# ─────────────────────────────────────────────
-action "Setting up container stack (LiteLLM + Squid)..."
-
-DOCKER_DIR="/home/openclaw/openclaw-docker"
-mkdir -p "$DOCKER_DIR"
-
-# If the internal network exists with a different subnet, tear it down first.
-# (Re-runs after the static-IP migration would otherwise fail to recreate networks.)
-_INT_NET="openclaw-docker_openclaw-internal"
-if podman network exists "$_INT_NET" 2>/dev/null; then
-    _CURRENT_SUBNET=$(podman network inspect "$_INT_NET" 2>/dev/null \
-        | grep '"subnet"' | head -1 | grep -oP '"\K[^"]+' | head -1)
-    if [[ "$_CURRENT_SUBNET" != "192.168.100.0/24" ]]; then
-        action "Migrating container networks to static-IP subnet..."
-        bash -c "cd '${DOCKER_DIR}' && podman-compose down --remove-orphans" >> "$INSTALL_LOG" 2>&1 || true
-        podman network rm "$_INT_NET" >> "$INSTALL_LOG" 2>&1 || true
-        podman network rm "openclaw-docker_openclaw-external" >> "$INSTALL_LOG" 2>&1 || true
-    fi
-fi
-
-# Generate LiteLLM master key — OpenClaw uses this instead of the real API key.
-# Real key lives only inside the LiteLLM container.
-LITELLM_MASTER_KEY=""
-if [[ -f "${DOCKER_DIR}/.env" ]]; then
-    LITELLM_MASTER_KEY=$(grep '^LITELLM_MASTER_KEY=' "${DOCKER_DIR}/.env" 2>/dev/null | cut -d= -f2 || echo "")
-fi
-if [[ -z "$LITELLM_MASTER_KEY" ]]; then
-    LITELLM_MASTER_KEY="sk-openclaw-$(openssl rand -hex 20)"
-fi
-
-# ── docker-compose.yml ──
-cat > "${DOCKER_DIR}/docker-compose.yml" <<'COMPOSE'
-version: "3.8"
-
-networks:
-  openclaw-internal:
-    internal: true       # no internet route — LiteLLM is trapped here
-    ipam:
-      config:
-        - subnet: 192.168.100.0/24   # fixed subnet so LiteLLM always gets 192.168.100.10
-  openclaw-external:
-    driver: bridge       # internet access — Squid only
-
-services:
-  openclaw-squid:
-    image: docker.io/ubuntu/squid:latest
-    container_name: openclaw-squid
-    networks:
-      - openclaw-internal   # reachable from LiteLLM
-      - openclaw-external   # has internet for forwarding
-    volumes:
-      - ./squid.conf:/etc/squid/squid.conf:ro
-      - ./allowed-domains.txt:/etc/squid/allowed-domains.txt:ro
-    ports:
-      - "127.0.0.1:3128:3128"
-    restart: unless-stopped
-
-  openclaw-litellm:
-    image: ghcr.io/berriai/litellm:main-latest
-    container_name: openclaw-litellm
-    networks:
-      openclaw-internal:
-        ipv4_address: 192.168.100.10  # static IP — host reaches it at this address directly
-                                       # (Podman DNAT is broken for internal networks)
-    environment:
-      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
-      - LITELLM_MASTER_KEY=${LITELLM_MASTER_KEY}
-      - http_proxy=http://openclaw-squid:3128
-      - https_proxy=http://openclaw-squid:3128
-    volumes:
-      - ./litellm-config.yaml:/app/config.yaml:ro
-      - litellm-data:/app/.litellm
-    command: --config /app/config.yaml --port 4000 --num_workers 1
-    depends_on:
-      - openclaw-squid
-    restart: unless-stopped
-
-volumes:
-  litellm-data:
-COMPOSE
-
-# ── litellm-config.yaml ──
-cat > "${DOCKER_DIR}/litellm-config.yaml" <<'LITELLM'
-model_list:
-  - model_name: claude-sonnet-4-6
-    litellm_params:
-      model: anthropic/claude-sonnet-4-6
-      api_key: os.environ/ANTHROPIC_API_KEY
-
-litellm_settings:
-  max_budget: BUDGET_PLACEHOLDER
-  budget_duration: 1mo
-  drop_params: true
-LITELLM
-# Substitute the actual budget value
-sed -i "s/BUDGET_PLACEHOLDER/${API_BUDGET}/" "${DOCKER_DIR}/litellm-config.yaml"
-
-# ── squid.conf (container-friendly: logs to stdout/stderr) ──
-cat > "${DOCKER_DIR}/squid.conf" <<'SQUIDCONF'
-# OpenClaw egress filter — containerized
-http_port 3128
-
-acl localnet src 127.0.0.0/8    # host loopback — OpenClaw connects from 127.0.0.1
-acl localnet src 10.0.0.0/8
-acl localnet src 172.16.0.0/12
-acl localnet src 192.168.0.0/16  # covers static LiteLLM subnet 192.168.100.0/24
-acl SSL_ports port 443
-acl Safe_ports port 80
-acl Safe_ports port 443
-acl CONNECT method CONNECT
-
-acl allowed_domains dstdomain "/etc/squid/allowed-domains.txt"
-
-http_access deny CONNECT !SSL_ports
-http_access allow localnet allowed_domains
-http_access deny all
-
-access_log stdio:/dev/stdout
-cache_log stdio:/dev/stderr
-cache deny all
-
-connect_timeout 30 seconds
-read_timeout 60 seconds
-SQUIDCONF
-
-# ── allowed-domains.txt ──
-cat > "${DOCKER_DIR}/allowed-domains.txt" <<'DOMAINS'
-.anthropic.com
-.openai.com
-.telegram.org
-.t.me
-.discord.com
-.discord.gg
-.wordpress.org
-.w.org
-.packagist.org
-.getcomposer.org
-.npmjs.org
-.npmjs.com
-.ubuntu.com
-.debian.org
-.letsencrypt.org
-.tailscale.com
-.github.com
-.githubusercontent.com
-.gravatar.com
-.woocommerce.com
-DOMAINS
-
-# ── .env for docker-compose (REAL Anthropic API key lives here only) ──
-cat > "${DOCKER_DIR}/.env" <<CONTAINERENV
-ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
-LITELLM_MASTER_KEY=${LITELLM_MASTER_KEY}
-CONTAINERENV
-chmod 600 "${DOCKER_DIR}/.env"
-
-chown -R openclaw:openclaw "$DOCKER_DIR"
-
-# Pull images and start the container stack
-spin "Starting LiteLLM + Squid containers (first run pulls images, may take a minute)" \
-    bash -c "cd '${DOCKER_DIR}' && podman-compose up -d"
-
-# Wait up to 60 s for LiteLLM to be ready
-action "Waiting for LiteLLM to be ready..."
-LITELLM_READY=false
-for _i in $(seq 1 20); do
-    if curl -sf http://127.0.0.1:4000/health > /dev/null 2>&1; then
-        LITELLM_READY=true
-        break
-    fi
-    sleep 3
-done
-if [[ "$LITELLM_READY" == "true" ]]; then
-    action "${GREEN}✓${NC} LiteLLM proxy ready (budget cap: \$${API_BUDGET}/month)"
-else
-    action "${YELLOW}!${NC} LiteLLM not yet responding — it may still be starting. Check: podman logs openclaw-litellm"
-fi
-
 action "Writing configuration..."
 OCLAW_HOME="/home/openclaw"
 OCLAW_CONFIG="${OCLAW_HOME}/.openclaw"
@@ -923,7 +708,7 @@ cat > "${OCLAW_CONFIG}/openclaw.json" <<OCJSON
     "agents": {
         "defaults": {
             "model": {
-                "primary": "anthropic/claude-sonnet-4-6"
+                "primary": "anthropic/claude-sonnet-4-5-20250929"
             }
         }
     },
@@ -953,9 +738,7 @@ cat > "${OCLAW_CONFIG}/openclaw.json" <<OCJSON
         "WP_PATH": "${WP_PATH}",
         "WP_SITE_URL": "${WP_PROTOCOL}://${WP_DOMAIN}",
         "WP_APP_USER": "${WP_ADMIN_USER}",
-        "WP_APP_PASSWORD": "${WP_APP_PASSWORD}",
-        "TELEGRAM_BOT_TOKEN": "${TELEGRAM_BOT_TOKEN}",
-        "TELEGRAM_CHAT_ID": "${TELEGRAM_USER_ID}"
+        "WP_APP_PASSWORD": "${WP_APP_PASSWORD}"
     }
 }
 OCJSON
@@ -1000,22 +783,8 @@ action "${GREEN}✓${NC} OpenClaw configured"
 progress 9 "Starting OpenClaw service..."
 
 cat > /home/openclaw/.env <<ENV
-# LiteLLM proxy — master key (real Anthropic API key is inside the container only)
-ANTHROPIC_API_KEY=${LITELLM_MASTER_KEY}
-ANTHROPIC_BASE_URL=http://192.168.100.10:4000
-# Egress proxy — routes external Node.js HTTP/HTTPS through Squid's allowlist
-http_proxy=http://127.0.0.1:3128
-https_proxy=http://127.0.0.1:3128
-GLOBAL_AGENT_HTTP_PROXY=http://127.0.0.1:3128
-# Bypass proxy for LiteLLM (direct bridge IP) and localhost
-NO_PROXY=127.0.0.1,localhost,::1,192.168.100.10
-no_proxy=127.0.0.1,localhost,::1,192.168.100.10
-GLOBAL_AGENT_NO_PROXY=127.0.0.1,localhost,192.168.100.10
-# Node.js: bootstrap global-agent proxy + V8 heap limit
-NODE_OPTIONS=--require ${GLOBAL_AGENT_BOOTSTRAP} --max-old-space-size=1024
-# Bot & WordPress
+ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
 TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
-TELEGRAM_CHAT_ID=${TELEGRAM_USER_ID}
 WP_SITE_URL=${WP_PROTOCOL}://${WP_DOMAIN}
 WP_APP_USER=${WP_ADMIN_USER}
 WP_APP_PASSWORD=${WP_APP_PASSWORD}
@@ -1030,34 +799,11 @@ if ! grep -qF 'source ~/.env' /home/openclaw/.bashrc 2>/dev/null; then
     echo 'set -a; source ~/.env; set +a' >> /home/openclaw/.bashrc
 fi
 
-# Resolve podman-compose binary path (apt installs to /usr/bin, pipx to ~/.local/bin)
-PODMAN_COMPOSE_BIN="$(command -v podman-compose)"
-
-# Create systemd service for the container stack (LiteLLM + Squid)
-cat > /etc/systemd/system/openclaw-containers.service <<CONTAINERS
-[Unit]
-Description=OpenClaw Container Stack (LiteLLM + Squid)
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=oneshot
-RemainAfterExit=yes
-WorkingDirectory=/home/openclaw/openclaw-docker
-ExecStart=${PODMAN_COMPOSE_BIN} up -d
-ExecStop=${PODMAN_COMPOSE_BIN} down
-TimeoutStartSec=120
-
-[Install]
-WantedBy=multi-user.target
-CONTAINERS
-
-# Create systemd service for OpenClaw (depends on containers being up)
+# Create systemd service
 cat > /etc/systemd/system/openclaw.service <<SERVICE
 [Unit]
 Description=OpenClaw AI Agent Gateway
-After=network.target mariadb.service nginx.service openclaw-containers.service
-Wants=openclaw-containers.service
+After=network.target mariadb.service nginx.service
 
 [Service]
 Type=simple
@@ -1075,9 +821,8 @@ StandardError=journal
 WantedBy=multi-user.target
 SERVICE
 
-action "Enabling systemd services..."
+action "Enabling systemd service..."
 quiet systemctl daemon-reload
-quiet systemctl enable openclaw-containers
 quiet systemctl enable openclaw
 systemctl start openclaw >> "$INSTALL_LOG" 2>&1
 action "${GREEN}✓${NC} OpenClaw service started"
@@ -1094,20 +839,6 @@ if [[ "$EXISTING_WORDPRESS" != "true" ]]; then
     quiet ufw allow ssh
     quiet ufw allow 'Nginx Full'
     quiet ufw --force enable
-
-    # UFW sets FORWARD policy to DROP, which blocks Podman containers from reaching
-    # the internet. Add persistent iptables rules to allow Podman bridge forwarding.
-    spin "Allowing Podman container forwarding through firewall" bash -c '
-        iptables -C FORWARD -s 10.89.0.0/16 -j ACCEPT 2>/dev/null || iptables -I FORWARD -s 10.89.0.0/16 -j ACCEPT
-        iptables -C FORWARD -d 10.89.0.0/16 -j ACCEPT 2>/dev/null || iptables -I FORWARD -d 10.89.0.0/16 -j ACCEPT
-        mkdir -p /etc/iptables
-        iptables-save > /etc/iptables/rules.v4
-    '
-    # Install iptables-persistent so rules survive reboots
-    if ! dpkg -l iptables-persistent &>/dev/null; then
-        DEBIAN_FRONTEND=noninteractive spin "Installing iptables-persistent" \
-            apt-get install -y -qq iptables-persistent
-    fi
     quiet systemctl enable fail2ban
     quiet systemctl start fail2ban
     action "${GREEN}✓${NC} Firewall configured"
@@ -1147,14 +878,6 @@ echo -e "${BOLD}  OpenClaw AI Agent${NC}"
 echo "  Status:     ${OPENCLAW_STATUS}"
 echo "  Config:     ${OCLAW_CONFIG}/openclaw.json"
 echo "  Logs:       journalctl -u openclaw -f"
-echo ""
-echo -e "${BOLD}  Container Stack (LiteLLM + Squid)${NC}"
-echo "  Status:     $(systemctl is-active openclaw-containers 2>/dev/null || echo 'unknown')"
-echo "  LiteLLM:    http://127.0.0.1:4000  (API proxy, budget: \$${API_BUDGET}/month)"
-echo "  Squid:      http://127.0.0.1:3128  (egress filter, allowlist enforced)"
-echo "  API key:    stored inside container only — not in OpenClaw process"
-echo "  Containers: podman ps"
-echo "  Logs:       podman logs openclaw-litellm"
 echo ""
 
 echo -e "${BOLD}  Telegram Bot${NC}"
@@ -1199,21 +922,9 @@ Telegram:
   Bot Token:  ${TELEGRAM_BOT_TOKEN}
   User ID:    ${TELEGRAM_USER_ID}
 
-LiteLLM Proxy (API budget enforcement):
-  Endpoint:   http://127.0.0.1:4000
-  Budget:     \$${API_BUDGET}/month (resets monthly)
-  Master Key: ${LITELLM_MASTER_KEY}
-  Real API key stored in: /home/openclaw/openclaw-docker/.env (container only)
-  Config:     /home/openclaw/openclaw-docker/litellm-config.yaml
-
-Squid Egress Proxy:
-  Endpoint:   http://127.0.0.1:3128
-  Allowlist:  /home/openclaw/openclaw-docker/allowed-domains.txt
-  Container:  openclaw-squid
-
 OpenClaw:
   Config:     ${OCLAW_CONFIG}/openclaw.json
-  Env:        /home/openclaw/.env (uses LiteLLM master key, NOT real Anthropic key)
+  Env:        /home/openclaw/.env
 
 Mode: $(if [[ "$EXISTING_WORDPRESS" == "true" ]]; then echo "Existing WordPress"; else echo "Fresh Install"; fi)
 
